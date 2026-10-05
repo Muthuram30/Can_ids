@@ -1,0 +1,26 @@
+[Unit]
+Description=Vehicle-IDS controlled USB demonstration trigger
+# Refuses to pile up duplicate instances if the stick is bounced quickly.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=silicon
+Group=silicon
+WorkingDirectory=/home/silicon/car_project
+Environment=PROJECT_DIR=/home/silicon/car_project
+Environment=ATTACKER_IP=10.214.203.60
+# Registered demo USB identity -- fill these in for your specific stick.
+# Find them with: udevadm info -a -n /dev/sdX | grep -E 'idVendor|idProduct|serial'
+Environment=EXPECTED_VENDOR=0000
+Environment=EXPECTED_PRODUCT=0000
+Environment=EXPECTED_SERIAL=
+ExecStart=/usr/bin/python3 /home/silicon/car_project/usb_attack_trigger.py
+# udev sets ID_VENDOR_ID/ID_MODEL_ID/ID_SERIAL_SHORT in its own environment when it
+# runs `systemctl start`; systemd does not forward the caller's environment to a
+# transient/unit start by default, so the udev rule below also writes them into
+# /run/vehicle-ids/udev_env and this unit reads them via EnvironmentFile.
+EnvironmentFile=-/run/vehicle-ids/udev_env
+
+[Install]
+WantedBy=multi-user.target

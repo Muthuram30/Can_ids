@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vehicle Control Center</title>
+<style>
+  body{font-family:Arial;background:#111;color:#eee;text-align:center;margin:0;padding:16px;}
+  h1{margin:8px 0;font-size:22px;}
+  .panel{display:flex;flex-wrap:wrap;justify-content:center;gap:20px;margin-top:16px;}
+  .card{background:#1c1c1c;border-radius:14px;padding:18px;min-width:220px;}
+  #joyBase{width:220px;height:220px;border-radius:50%;background:radial-gradient(circle,#242424,#1a1a1a);
+           border:2px solid #444;position:relative;touch-action:none;margin:0 auto;}
+  #joyStick{width:80px;height:80px;border-radius:50%;background:#28a745;position:absolute;
+            left:70px;top:70px;box-shadow:0 0 12px rgba(40,167,69,.6);}
+  .lockbtn{width:140px;height:56px;font-size:17px;font-weight:bold;border:none;border-radius:10px;
+           margin:6px;cursor:pointer;}
+  .on{background:#28a745;color:#fff;}
+  .off{background:#dc3545;color:#fff;}
+  .status{text-align:left;font-size:15px;line-height:1.7;}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;}
+  .online{background:#28a745;} .offline{background:#dc3545;}
+  .warn{color:#ff9800;font-weight:bold;}
+
+  /* ---------- Intrusion Detection banner / card ---------- */
+  #idsBanner{margin:10px auto 4px;max-width:640px;border-radius:14px;padding:16px;
+             font-size:30px;font-weight:900;letter-spacing:2px;transition:background-color .4s,color .4s;
+             border:3px solid rgba(255,255,255,.15);}
+  #idsBanner.safe{background:#123d1e;color:#3ddc70;box-shadow:0 0 18px rgba(61,220,112,.35);}
+  #idsBanner.unsafe{background:#4a1010;color:#ff4d4d;box-shadow:0 0 22px rgba(255,77,77,.55);
+                     animation:pulse 1s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 12px rgba(255,77,77,.4);}50%{box-shadow:0 0 30px rgba(255,77,77,.9);}100%{box-shadow:0 0 12px rgba(255,77,77,.4);}}
+  #idsSub{font-size:12px;font-weight:normal;letter-spacing:1px;color:#bbb;margin-top:4px;}
+  .demo-tag{display:inline-block;background:#ff9800;color:#111;font-size:11px;font-weight:bold;
+            padding:2px 8px;border-radius:6px;margin-bottom:8px;letter-spacing:1px;}
+  .ids-card{text-align:left;font-size:14px;line-height:1.9;min-width:260px;}
+  .ids-row b.state-safe{color:#3ddc70;}
+  .ids-row b.state-unsafe{color:#ff4d4d;}
+  .ids-row b.state-warn{color:#ff9800;}
+  #countdownWrap{margin-top:8px;display:none;}
+  #countdownBar{background:#333;border-radius:8px;height:10px;overflow:hidden;margin-top:4px;}
+  #countdownFill{background:#ff9800;height:100%;width:100%;transition:width 1s linear;}
+  #idsAlert{display:none;font-size:15px;letter-spacing:3px;color:#ffb3b3;margin-bottom:2px;}
+  #idsCountLine{display:none;font-size:20px;letter-spacing:2px;color:#ffd27a;margin-top:6px;}
+  /* attacker-side lock-out (shown only to the blocked attacker) */
+  body.locked .panel, body.locked #idsBanner, body.locked h1, body.locked .demo-tag{
+    filter:grayscale(1) brightness(.5);pointer-events:none;user-select:none;}
+  #blockedOverlay{display:none;position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.72);
+    align-items:center;justify-content:center;flex-direction:column;color:#ff4d4d;
+    font-size:64px;font-weight:900;letter-spacing:6px;text-align:center;}
+  #blockedOverlay small{font-size:16px;letter-spacing:1px;color:#ccc;margin-top:10px;font-weight:normal;}
+  #offlineBar{display:none;position:fixed;left:0;right:0;top:0;z-index:40;background:#ff9800;color:#111;
+    font-weight:bold;padding:8px;font-size:14px;}
+  .ml-toggle{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+  .switch{position:relative;display:inline-block;width:46px;height:24px;}
+  .switch input{opacity:0;width:0;height:0;}
+  .slider{position:absolute;cursor:pointer;inset:0;background:#555;border-radius:24px;transition:.2s;}
+  .slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#eee;border-radius:50%;transition:.2s;}
+  input:checked + .slider{background:#28a745;}
+  input:checked + .slider:before{transform:translateX(22px);}
+  #mlScoreBar{background:#333;border-radius:8px;height:10px;overflow:hidden;margin-top:4px;}
+  #mlScoreFill{height:100%;width:0%;background:#3ddc70;transition:width .3s,background-color .3s;}
+  #mlReasonRow{display:none;}
+</style>
+</head>
+<body>
+<div id="offlineBar">CONNECTION TO VEHICLE LOST — retrying… (this is a disconnect, not a block)</div>
+<div id="blockedOverlay">BLOCKED<small>This client has been blocked by the Vehicle Intrusion Detection System</small></div>
+<h1>Vehicle Control Center — Raspberry Pi Gateway</h1>
+
+<div class="demo-tag">⚠ DEMONSTRATION / TEST MODE — simulated block, no live network isolation</div>
+<div id="idsBanner" class="safe">
+  <div id="idsAlert">ATTACKER DETECTED</div>
+  <span id="idsLabel">SAFE</span>
+  <div id="idsCountLine">BLOCKING IN: <span id="idsCountBig">-</span> seconds</div>
+  <div id="idsSub">Vehicle Intrusion Detection System</div>
+</div>
+
+<div class="panel">
+
+  <div class="card">
+    <h3>Drive</h3>
+    <div id="joyBase"><div id="joyStick"></div></div>
+    <p>Command: <b id="cmdLabel">S</b></p>
+  </div>
+
+  <div class="card">
+    <h3>Solenoid Lock</h3>
+    <button class="lockbtn on" onclick="setLock(true)">LOCK ON</button>
+    <button class="lockbtn off" onclick="setLock(false)">LOCK OFF</button>
+    <p>State: <b id="lockLabel">-</b></p>
+  </div>
+
+  <div class="card status">
+    <h3>Live Sensors <span style="font-size:11px;color:#888">(continuous)</span></h3>
+    <div>ToF: <b id="tof">-</b> mm</div>
+    <div>Ultrasonic L: <b id="usL">-</b> cm</div>
+    <div>Ultrasonic R: <b id="usR">-</b> cm</div>
+    <div>Obstacle: <b id="obs" class="">-</b></div>
+    <h3>Node Link Status</h3>
+    <div><span class="dot" id="dotMotor"></span>Motor ECU</div>
+    <div><span class="dot" id="dotSensor"></span>Sensor ECU</div>
+    <div><span class="dot" id="dotSecurity"></span>Security ECU</div>
+  </div>
+
+  <div class="card ids-card">
+    <h3>🛡 Intrusion Detection <span style="font-size:11px;color:#888">(demo)</span></h3>
+    <div class="ids-row">Security status: <b id="idsStatus" class="state-safe">SAFE</b></div>
+    <div class="ids-row">Vehicle-IDS AP (<span id="idsIface">wlan1</span>): <b id="idsWlan" class="state-warn">-</b></div>
+    <div class="ids-row">Configured attacker IP: <b id="idsAttackerIp">-</b></div>
+    <div class="ids-row">Attacker on AP: <b id="idsAtkPresent" class="state-safe">-</b></div>
+    <div class="ids-row">Detection state: <b id="idsDetected" class="state-safe">No intrusion detected</b></div>
+    <div class="ids-row">Blocking state: <b id="idsBlocking" class="state-safe">Idle</b></div>
+    <div id="countdownWrap">
+      <div class="ids-row">Simulated block in: <b id="idsCountdown">-</b> s</div>
+      <div id="countdownBar"><div id="countdownFill"></div></div>
+    </div>
+    <div class="ids-row" style="margin-top:8px;color:#aaa;font-size:12px;">Last event: <span id="idsEvent">-</span></div>
+  </div>
+
+  <div class="card ids-card">
+    <h3>🔌 USB Attack Vector <span style="font-size:11px;color:#888">(demo)</span></h3>
+    <div class="ids-row">USB: <b id="usbPresent" class="state-safe">NOT PRESENT</b></div>
+    <div class="ids-row">Attack script: <b id="usbAttack" class="state-safe">IDLE</b></div>
+    <div class="ids-row">Destination: <b id="usbDest">-</b></div>
+    <div class="ids-row" style="margin-top:8px;color:#aaa;font-size:12px;">Device: <span id="usbDevice">-</span></div>
+  </div>
+
+  <div class="card ids-card">
+    <h3>🧠 CAN ML Anomaly Detection</h3>
+    <div class="ml-toggle">
+      <span>ML detection <span style="font-size:11px;color:#888">(replaces rule-based while ON)</span></span>
+      <label class="switch"><input type="checkbox" id="mlToggle" onchange="setMl(this.checked)"><span class="slider"></span></label>
+    </div>
+    <div class="ids-row">Status: <b id="mlStatus" class="state-safe">OFF</b></div>
+    <div class="ids-row">Anomaly score: <b id="mlScore">-</b></div>
+    <div id="mlScoreBar"><div id="mlScoreFill"></div></div>
+    <div class="ids-row" id="mlReasonRow" style="margin-top:6px;">Last detection reason: <b id="mlReason">-</b></div>
+    <div class="ids-row" style="margin-top:8px;color:#aaa;font-size:12px;" id="mlError"></div>
+  </div>
+
+</div>
+
+<script>
+const base = document.getElementById('joyBase');
+const stick = document.getElementById('joyStick');
+const cmdLabel = document.getElementById('cmdLabel');
+let dragging = false;
+let locked = false, wasBlocked = false, failCount = 0;
+
+function applyBlocked(){
+  locked = true; wasBlocked = true; dragging = false;
+  document.body.classList.add('locked');
+  document.getElementById('blockedOverlay').style.display = 'flex';
+  document.getElementById('offlineBar').style.display = 'none';
+}
+function clearBlocked(){
+  locked = false; wasBlocked = false;
+  document.body.classList.remove('locked');
+  document.getElementById('blockedOverlay').style.display = 'none';
+}
+function handleControlResponse(r){ if (r.status === 403) applyBlocked(); }
+const R = 70;      // max stick travel, px
+const CENTER = 110; // base radius (half of 220px)
+
+function setStickPos(dx, dy){
+  stick.style.left = (CENTER - 40 + dx) + 'px';
+  stick.style.top  = (CENTER - 40 + dy) + 'px';
+}
+
+function resetStick(){
+  setStickPos(0, 0);
+  sendJoystick(0, 0);
+}
+
+function labelFor(x, y){
+  if (Math.abs(x) < 20 && Math.abs(y) < 20) return 'S';
+  if (Math.abs(y) >= Math.abs(x)) return y > 0 ? 'F' : 'B';
+  return x > 0 ? 'R' : 'L';
+}
+
+function sendJoystick(x, y){
+  // x,y passed to server in [-100,100]; y positive = forward
+  if (locked) return;
+  cmdLabel.textContent = labelFor(x, -y);
+  fetch('/api/joystick', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({x: x, y: -y})   // invert: screen-up (negative dy) = forward
+  }).then(handleControlResponse).catch(() => {});
+}
+
+function handleMove(clientX, clientY){
+  const rect = base.getBoundingClientRect();
+  let dx = clientX - (rect.left + rect.width / 2);
+  let dy = clientY - (rect.top + rect.height / 2);
+  const dist = Math.hypot(dx, dy);
+  if (dist > R){ dx = dx * R / dist; dy = dy * R / dist; }
+  setStickPos(dx, dy);
+  sendJoystick((dx / R) * 100, (dy / R) * 100);
+}
+
+base.addEventListener('pointerdown', e => { dragging = true; base.setPointerCapture(e.pointerId); handleMove(e.clientX, e.clientY); });
+base.addEventListener('pointermove', e => { if (dragging) handleMove(e.clientX, e.clientY); });
+base.addEventListener('pointerup',     () => { dragging = false; resetStick(); });
+base.addEventListener('pointercancel', () => { dragging = false; resetStick(); });
+
+function setMl(enabled){
+  fetch('/api/ml/toggle', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: enabled})
+  }).catch(() => {});
+}
+
+function setLock(on){
+  if (locked) return;
+  fetch('/api/solenoid', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({on: on})
+  }).then(handleControlResponse).catch(() => {});
+}
+
+function poll(){
+  fetch('/api/state').then(r => r.json()).then(s => {
+    failCount = 0;
+    document.getElementById('offlineBar').style.display = 'none';
+    if (s.you && s.you.blocked) applyBlocked(); else if (locked) clearBlocked();
+    document.getElementById('tof').textContent   = s.tof_mm ?? '-';
+    document.getElementById('usL').textContent   = s.us_left_cm ?? '-';
+    document.getElementById('usR').textContent   = s.us_right_cm ?? '-';
+    const obsEl = document.getElementById('obs');
+    obsEl.textContent = s.obstacle_flags ? ('0x' + s.obstacle_flags.toString(16)) : 'clear';
+    obsEl.className = s.obstacle_flags ? 'warn' : '';
+    document.getElementById('lockLabel').textContent = s.lock_state;
+    document.getElementById('dotMotor').className    = 'dot ' + (s.nodes.motor.online    ? 'online' : 'offline');
+    document.getElementById('dotSensor').className   = 'dot ' + (s.nodes.sensor.online   ? 'online' : 'offline');
+    document.getElementById('dotSecurity').className = 'dot ' + (s.nodes.security.online ? 'online' : 'offline');
+
+    // ---- Intrusion Detection ----
+    const sec = s.security;
+    if (sec) {
+      const banner = document.getElementById('idsBanner');
+      const isUnsafe = sec.status === 'UNSAFE';
+      banner.className = isUnsafe ? 'unsafe' : 'safe';
+      document.getElementById('idsLabel').textContent = isUnsafe ? 'UNSAFE' : 'SAFE';
+      const counting = sec.phase === 'COUNTDOWN';
+      document.getElementById('idsAlert').style.display = counting ? 'block' : 'none';
+      document.getElementById('idsCountLine').style.display = counting ? 'block' : 'none';
+      document.getElementById('idsCountBig').textContent = sec.seconds_remaining;
+      const w = sec.wlan1 || {};
+      document.getElementById('idsSub').textContent = (w.state && w.state !== 'ACTIVE' && !counting)
+        ? 'Vehicle-IDS Wi-Fi (' + w.iface + ') ' + w.state + ' — monitoring'
+        : 'Vehicle Intrusion Detection System';
+
+      const statusEl = document.getElementById('idsStatus');
+      statusEl.textContent = sec.status;
+      statusEl.className = isUnsafe ? 'state-unsafe' : 'state-safe';
+
+      document.getElementById('idsAttackerIp').textContent = sec.attacker_ip;
+
+      const detEl = document.getElementById('idsDetected');
+      if (sec.detected) {
+        detEl.textContent = 'INTRUSION DETECTED (' + sec.detected_ip + ')';
+        detEl.className = 'state-unsafe';
+      } else {
+        detEl.textContent = 'No intrusion detected';
+        detEl.className = 'state-safe';
+      }
+
+      const blockEl = document.getElementById('idsBlocking');
+      const cdWrap = document.getElementById('countdownWrap');
+      if (sec.blocking) {
+        blockEl.textContent = 'Blocking in progress (simulated)…';
+        blockEl.className = 'state-warn';
+        cdWrap.style.display = 'block';
+        document.getElementById('idsCountdown').textContent = sec.seconds_remaining;
+        const pct = sec.block_delay > 0 ? (100 * sec.seconds_remaining / sec.block_delay) : 0;
+        document.getElementById('countdownFill').style.width = pct + '%';
+      } else if (sec.blocked) {
+        blockEl.textContent = 'Attacker blocked (simulated)';
+        blockEl.className = 'state-safe';
+        cdWrap.style.display = 'none';
+      } else {
+        blockEl.textContent = 'Idle';
+        blockEl.className = 'state-safe';
+        cdWrap.style.display = 'none';
+      }
+
+      document.getElementById('idsEvent').textContent = sec.last_event;
+
+      const wEl = document.getElementById('idsWlan');
+      document.getElementById('idsIface').textContent = w.iface || 'wlan1';
+      wEl.textContent = w.state === 'ACTIVE' ? 'ACTIVE (' + w.ip + ')' : (w.state || '-');
+      wEl.className = w.state === 'ACTIVE' ? 'state-safe' : 'state-warn';
+      const aEl = document.getElementById('idsAtkPresent');
+      aEl.textContent = sec.attacker_present ? 'PRESENT' : 'not present';
+      aEl.className = sec.attacker_present ? 'state-unsafe' : 'state-safe';
+
+      const usb = sec.usb || {};
+      const usbP = document.getElementById('usbPresent');
+      usbP.textContent = usb.present ? 'DETECTED' : 'NOT PRESENT';
+      usbP.className = usb.present ? 'state-warn' : 'state-safe';
+      const usbA = document.getElementById('usbAttack');
+      const active = usb.status === 'ATTACK_TRIGGERED' || usb.status === 'MONITORING';
+      usbA.textContent = usb.status === 'BLOCKED' ? 'CONTAINED' : (active ? 'ACTIVE' : (usb.status || 'IDLE'));
+      usbA.className = usb.status === 'BLOCKED' ? 'state-safe' : (active ? 'state-unsafe' : 'state-safe');
+      document.getElementById('usbDest').textContent = sec.attacker_ip;
+      document.getElementById('usbDevice').textContent = usb.device || '-';
+
+      const ml = sec.ml || {};
+      const mlToggle = document.getElementById('mlToggle');
+      if (document.activeElement !== mlToggle) mlToggle.checked = !!ml.enabled;  // don't fight the user mid-click
+      const mlStatusEl = document.getElementById('mlStatus');
+      if (!ml.available) {
+        mlStatusEl.textContent = 'MODEL NOT AVAILABLE'; mlStatusEl.className = 'state-warn';
+        document.getElementById('mlError').textContent = ml.error || 'run train_can_ids_model.py on the Pi';
+      } else {
+        mlStatusEl.textContent = ml.enabled ? (ml.anomaly ? 'ANOMALY' : 'MONITORING') : 'OFF';
+        mlStatusEl.className = ml.enabled ? (ml.anomaly ? 'state-unsafe' : 'state-safe') : 'state-safe';
+        document.getElementById('mlError').textContent = '';
+      }
+      const scoreEl = document.getElementById('mlScore');
+      const fillEl = document.getElementById('mlScoreFill');
+      if (ml.score === null || ml.score === undefined) {
+        scoreEl.textContent = '-'; fillEl.style.width = '0%';
+      } else {
+        scoreEl.textContent = ml.score.toFixed(3) + (ml.anomaly ? ' (anomalous)' : ' (normal)');
+        // map score roughly [-0.3, +0.3] -> [0%, 100%] fill, clamped
+        const pct = Math.max(0, Math.min(100, ((ml.score + 0.3) / 0.6) * 100));
+        fillEl.style.width = pct + '%';
+        fillEl.style.backgroundColor = ml.anomaly ? '#ff4d4d' : '#3ddc70';
+      }
+      const reasonRow = document.getElementById('mlReasonRow');
+      if (sec.detection_reason) {
+        reasonRow.style.display = 'block';
+        document.getElementById('mlReason').textContent = sec.detection_reason;
+      } else {
+        reasonRow.style.display = 'none';
+      }
+    }
+  }).catch(() => {
+    // backend unreachable: a disconnect, distinct from BLOCKED (only shown if we were not blocked)
+    if (++failCount >= 3 && !wasBlocked) document.getElementById('offlineBar').style.display = 'block';
+  });
+}
+setInterval(poll, 300);
+poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+[Unit]
+Description=Vehicle-IDS controlled USB demonstration — removal cleanup
+
+[Service]
+Type=oneshot
+User=silicon
+Group=silicon
+WorkingDirectory=/home/silicon/car_project
+Environment=PROJECT_DIR=/home/silicon/car_project
+ExecStart=/usr/bin/python3 /home/silicon/car_project/usb_attack_trigger.py --removed

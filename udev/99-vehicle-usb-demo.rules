@@ -1,0 +1,23 @@
+# Vehicle-IDS controlled USB demonstration.
+#
+# Matches ONLY the specific, pre-registered demonstration USB stick below -- not
+# every USB storage device. Fill in the three IDs for your actual demo stick:
+#   udevadm info -a -n /dev/sdX | grep -E 'idVendor|idProduct|serial'
+# (walk up to the top-level usb device node in that output for the serial).
+#
+# On insertion of the matching device: write its identity where the systemd
+# service can read it (systemd does not inherit udev's RUN+= environment), then
+# start the one-shot trigger service.
+# On removal: run the cleanup service, which stops the payload if still running.
+#
+# Install as: /etc/udev/rules.d/99-vehicle-usb-demo.rules
+# Reload with: sudo udevadm control --reload-rules && sudo udevadm trigger
+
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0000", ATTR{idProduct}=="0000", ATTR{serial}=="REPLACE_WITH_SERIAL", \
+  RUN+="/bin/sh -c 'mkdir -p /run/vehicle-ids && printf \"ID_VENDOR_ID=%s\\nID_MODEL_ID=%s\\nID_SERIAL_SHORT=%s\\nID_MODEL=%s\\n\" \"$env{ID_VENDOR_ID}\" \"$env{ID_MODEL_ID}\" \"$env{ID_SERIAL_SHORT}\" \"$env{ID_MODEL}\" > /run/vehicle-ids/udev_env'", \
+  RUN+="/usr/bin/systemctl --no-block start vehicle-usb-attack.service"
+
+# "remove" events use ENV{} rather than ATTR{}: the sysfs node is already gone by
+# the time this rule runs, but udev's cached device properties are still available.
+ACTION=="remove", SUBSYSTEM=="usb", ENV{ID_VENDOR_ID}=="0000", ENV{ID_MODEL_ID}=="0000", \
+  RUN+="/usr/bin/systemctl --no-block start vehicle-usb-attack-remove.service"
