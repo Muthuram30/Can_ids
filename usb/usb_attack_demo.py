@@ -26,7 +26,13 @@ import socket
 import sys
 import time
 
-ATTACKER_IP = os.environ.get("ATTACKER_IP", "10.214.203.60")
+from pathlib import Path
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env", override=False)
+
+ATTACKER_IP = os.environ.get("ATTACKER_IP", "10.50.0.100")
 ATTACKER_PORT = int(os.environ.get("ATTACKER_PORT", "4444"))  # arbitrary fixed demo port; both ends must agree
 MAX_ATTEMPTS = int(os.environ.get("USB_DEMO_MAX_ATTEMPTS", "6"))
 ATTEMPT_INTERVAL = float(os.environ.get("USB_DEMO_INTERVAL", "3"))

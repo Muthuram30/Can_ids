@@ -21,6 +21,8 @@ to this script. app.py loads that file; if it's missing, the ML toggle reports
 import json
 import os
 import random
+from pathlib import Path
+from dotenv import load_dotenv
 
 import joblib
 import numpy as np
@@ -31,7 +33,8 @@ from can_features import EXPECTED_RATE_HZ, FEATURE_NAMES, WINDOW_SECONDS, extrac
 
 random.seed(7)
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(HERE, "can_ids_model.joblib")
+load_dotenv(Path(HERE) / ".env", override=False)
+MODEL_PATH = str(Path(HERE) / os.getenv("ML_MODEL_PATH", "can_ids_model.joblib"))
 
 SIM_HOURS = 2.0          # simulated normal traffic to train on
 N_ANOMALY_CHECKS = 6      # just for the printed sanity check at the end

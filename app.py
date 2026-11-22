@@ -28,9 +28,20 @@ import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request, render_template
 
-from can_features import WINDOW_SECONDS as ML_WINDOW_SECONDS, extract_features
+PROJECT_ROOT = Path(__file__).resolve().parent
+# A real process environment takes precedence over the per-device .env file.
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+def project_path(name, default):
+    value = Path(os.environ.get(name, default)).expanduser()
+    return str(value if value.is_absolute() else PROJECT_ROOT / value)
+
+
+from can_features import WINDOW_SECONDS as ML_WINDOW_SECONDS, FEATURE_NAMES, extract_features
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("vehicle-ids")
@@ -50,12 +61,12 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)  # dashboard polls every
 # ================================================================================
 AP_IFACE = os.environ.get("AP_IFACE", "wlan1")
 AP_IP = os.environ.get("AP_IP", "10.50.0.1")
-ATTACKER_IP = os.environ.get("ATTACKER_IP", "10.214.203.60")
+ATTACKER_IP = os.environ.get("ATTACKER_IP", "10.50.0.100")
 ATTACKER_MAC = os.environ.get("ATTACKER_MAC", "").strip().lower()
 BLOCK_DELAY = int(os.environ.get("BLOCK_DELAY", "18"))
 REARM_COOLDOWN = int(os.environ.get("REARM_COOLDOWN", "5"))
 
-USB_STATE_FILE = os.environ.get("USB_STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "run", "usb_state.json"))
+USB_STATE_FILE = project_path("USB_STATE_FILE", "run/usb_state.json")
 USB_PRESENCE_TIMEOUT = 6.0     # if usb_attack_trigger.py hasn't updated the state file in this long, treat the USB as gone
 
 POLL_INTERVAL = 1.0            # monitor period, seconds
@@ -63,7 +74,7 @@ ABSENT_TICKS_BEFORE_CANCEL = 3  # tolerate brief probe misses (Wi-Fi power save)
 HTTP_PRESENCE_WINDOW = 4.0     # an HTTP request from the attacker counts as "present" for this long
 SERVICE_CHECK_INTERVAL = 5.0   # hostapd/dnsmasq status refresh
 STATUS_LOG_INTERVAL = 10.0     # periodic one-line status in the terminal
-AUTO_FIX_AP = os.environ.get("AUTO_FIX_AP", "1") == "1"  # re-apply wlan1 IP + restart hostapd/dnsmasq if wlan1 returns without its address
+AUTO_FIX_AP = os.environ.get("AUTO_FIX_AP", "0") == "1"  # re-apply wlan1 IP + restart hostapd/dnsmasq if wlan1 returns without its address
 FIX_COOLDOWN = 20.0
 
 # ---------------- CAN IDs (must match ECU firmware / project ID map) ----------------
@@ -79,11 +90,12 @@ ID_OBSTACLE_STATUS     = 0x122   # Sensor ECU -> Pi
 ID_LOCK_CMD             = 0x140  # Pi -> Security ECU
 ID_LOCK_STATUS          = 0x141  # Security ECU -> Pi
 
-CAN_CHANNEL = "can0"
+CAN_CHANNEL = os.environ.get("CAN_CHANNEL", "can0")
+CAN_BACKEND = os.environ.get("CAN_BACKEND", "socketcan")
 CONTROL_PATHS = {"/api/joystick", "/api/solenoid"}  # endpoints refused for a blocked attacker
 
 # ---------------- CAN ML anomaly detection (Isolation Forest, see train_can_ids_model.py) ----------------
-ML_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "can_ids_model.joblib")
+ML_MODEL_PATH = project_path("ML_MODEL_PATH", "can_ids_model.joblib")
 ml_bundle = None          # {"scaler", "model", "feature_names", "window_seconds"} once loaded
 ml_load_error = None
 try:
@@ -99,7 +111,14 @@ def load_ml_model():
     if ml_bundle is not None or joblib is None:
         return
     try:
-        ml_bundle = joblib.load(ML_MODEL_PATH)
+        candidate = joblib.load(ML_MODEL_PATH)
+        if (not isinstance(candidate, dict)
+                or not {"scaler", "model", "feature_names", "window_seconds"} <= candidate.keys()
+                or list(candidate["feature_names"]) != FEATURE_NAMES
+                or candidate["window_seconds"] != ML_WINDOW_SECONDS):
+            raise ValueError("incompatible live model bundle; use the root trainer")
+        ml_bundle = candidate
+        ml_load_error = None
         log.info("ML: loaded %s (trained on %d features)", ML_MODEL_PATH, len(ml_bundle["feature_names"]))
     except (OSError, ValueError, KeyError) as e:
         ml_load_error = f"could not load {ML_MODEL_PATH} ({e}) -- run train_can_ids_model.py"
@@ -134,7 +153,7 @@ def ml_score_now():
     anomaly = bool(ml_bundle["model"].predict(x)[0] == -1)
     return score, anomaly
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=str(PROJECT_ROOT / "templates"))
 
 # ---------------- CAN bus (opened lazily, re-opened if can0 goes away) ----------------
 bus = None
@@ -146,7 +165,7 @@ def get_bus():
     global bus, _can_err_logged
     if bus is None:
         try:
-            bus = can.interface.Bus(channel=CAN_CHANNEL, bustype="socketcan")
+            bus = can.interface.Bus(channel=CAN_CHANNEL, interface=CAN_BACKEND)
             _can_err_logged = False
             log.info("CAN: %s opened", CAN_CHANNEL)
         except Exception as e:  # can0 missing / down
@@ -279,7 +298,7 @@ def probe_attacker():
     Present if it answers a ping, OR (ICMP blocked, e.g. Windows firewall) its MAC is
     still associated to the AP -- so a client that left is noticed immediately."""
     ip = (find_ip_by_mac(ATTACKER_MAC) if ATTACKER_MAC else None) or ATTACKER_IP
-    rc, _ = run(["ping", "-c", "1", "-W", "1", ip], timeout=3)
+    rc, _ = run(["ping", "-I", AP_IFACE, "-c", "1", "-W", "1", ip], timeout=3)
     if rc == 0:
         return True, ip
     mac = ATTACKER_MAC or neigh_mac(ip)
@@ -300,6 +319,8 @@ def read_usb_state(now):
     try:
         with open(USB_STATE_FILE) as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("USB state must be an object")
         age = now - float(data.get("event_at") or 0)
         if age > USB_PRESENCE_TIMEOUT and data.get("status") not in ("IDLE", "REMOVED"):
             data["status"] = "REMOVED"
@@ -310,9 +331,10 @@ def read_usb_state(now):
             "status": data.get("status", "IDLE"),
             "device": data.get("device"),
             "payload_pid": data.get("payload_pid"),
+            "event_id": data.get("event_id"),
             "event_at": data.get("event_at"),
         }
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {"present": False, "attack_triggered": False, "status": "IDLE",
                 "device": None, "payload_pid": None, "event_at": None}
 
@@ -418,7 +440,7 @@ def try_fix_ap(now):
     rc2, _ = run(["sudo", "-n", "systemctl", "restart", "hostapd"], timeout=15)
     rc3, _ = run(["sudo", "-n", "systemctl", "restart", "dnsmasq"], timeout=15)
     if rc1 != 0:
-        log.error("Could not re-apply %s (need passwordless sudo, or run ./start_vehicle_ids.sh)", AP_IP)
+        log.error("Could not re-apply %s (need passwordless sudo, or configure networking separately with scripts/setup_wifi.py)", AP_IP)
     log.info("AP recovery: ip=%s hostapd=%s dnsmasq=%s", rc1, rc2, rc3)
 
 
@@ -451,7 +473,7 @@ def monitor_tick(now=None):
     present = False
     if iface["active"]:
         present, ip = probe_attacker()
-        if now - attacker_http_last < HTTP_PRESENCE_WINDOW:
+        if attacker_http_last and now - attacker_http_last < HTTP_PRESENCE_WINDOW:
             present = True
 
     usb = read_usb_state(now)
@@ -493,10 +515,12 @@ def monitor_tick(now=None):
         # The USB state file is the source of truth for present/attack_triggered/device/pid, but
         # once the IDS has blocked a USB-triggered attack, that containment (BLOCKED) must stick
         # on the dashboard even though the file itself still says MONITORING/ATTACK_TRIGGERED --
-        # only a fresh insertion (a new payload_pid) or a rearm should move it off BLOCKED.
+        # only a fresh insertion (a new event_id) or a rearm should move it off BLOCKED.
         was_blocked = (security["phase"] == "BLOCKED" and security["detection_reason"] == "USB_ATTACK"
                        and security["usb"]["status"] == "BLOCKED")
-        same_payload = was_blocked and usb.get("payload_pid") == security["usb"].get("payload_pid")
+        same_payload = was_blocked and usb.get("present") and (
+            usb.get("event_id") == security["usb"].get("event_id") if usb.get("event_id")
+            else usb.get("payload_pid") == security["usb"].get("payload_pid"))
         if same_payload:
             usb["status"] = "BLOCKED"
         security["usb"] = usb
@@ -675,6 +699,8 @@ def pi_heartbeat_loop():
 DEADZONE = 20
 last_motor_cmd = None
 last_motor_send_time = 0.0
+last_joystick_time = 0.0
+JOYSTICK_TIMEOUT = float(os.environ.get("JOYSTICK_TIMEOUT", "0.8"))
 MOTOR_RESEND_INTERVAL = 0.2  # keep-alive resend so the ECU failsafe timer doesn't trip while held
 
 
@@ -698,6 +724,8 @@ def send_motor_command(cmd):
 
 def motor_keepalive_loop():
     while True:
+        if last_motor_cmd not in (None, "S") and time.time() - last_joystick_time > JOYSTICK_TIMEOUT:
+            send_motor_command("S")
         if last_motor_cmd is not None and time.time() - last_motor_send_time > MOTOR_RESEND_INTERVAL:
             send_motor_command(last_motor_cmd)
         time.sleep(0.05)
@@ -714,6 +742,9 @@ def _client_hook():
     with security_lock:
         attacker_ip = security["attacker_ip"]
         is_blocked = addr in blocked_ips
+        can_contained = security["phase"] == "BLOCKED" and security["detection_reason"] == "CAN_ANOMALY"
+    if can_contained and request.path in CONTROL_PATHS:
+        return jsonify({"error": "CAN anomaly contained; controls disabled until rearm"}), 403
     if addr == attacker_ip:
         attacker_http_last = time.time()
     if is_blocked and request.path in CONTROL_PATHS:
@@ -727,10 +758,17 @@ def index():
 
 @app.route("/api/joystick", methods=["POST"])
 def api_joystick():
-    global last_motor_source
-    body = request.get_json(force=True)
-    x = float(body.get("x", 0))
-    y = float(body.get("y", 0))
+    global last_motor_source, last_joystick_time
+    body = request.get_json(silent=True)
+    try:
+        if not isinstance(body, dict):
+            raise ValueError()
+        x, y = float(body.get("x", 0)), float(body.get("y", 0))
+        if not all(math.isfinite(v) and -100 <= v <= 100 for v in (x, y)):
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({"error": "x and y must be finite numbers between -100 and 100"}), 400
+    last_joystick_time = time.time()
     cmd = joystick_to_command(x, y)
     last_motor_source = request.remote_addr
     send_motor_command(cmd)
@@ -748,7 +786,13 @@ def api_solenoid():
 @app.route("/api/ml/toggle", methods=["POST"])
 def api_ml_toggle():
     body = request.get_json(force=True, silent=True) or {}
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "enabled must be a JSON boolean"}), 400
     enabled = bool(body.get("enabled"))
+    if enabled and ml_bundle is None:
+        load_ml_model()
+        if ml_bundle is None:
+            return jsonify({"error": ml_load_error or "ML model unavailable", "enabled": False}), 503
     with security_lock:
         if security["ml"]["enabled"] == enabled:
             return jsonify(dict(security["ml"]))
@@ -773,7 +817,7 @@ def api_state():
     with security_lock:
         snapshot["security"] = dict(security)
         is_attacker = addr == security["attacker_ip"]
-        blocked = addr in blocked_ips and security["phase"] == "BLOCKED"
+        blocked = security["phase"] == "BLOCKED" and (addr in blocked_ips or security["detection_reason"] == "CAN_ANOMALY")
     snapshot["you"] = {"is_attacker": is_attacker, "blocked": blocked}
     return jsonify(snapshot)
 
@@ -786,4 +830,6 @@ if __name__ == "__main__":
     threading.Thread(target=pi_heartbeat_loop, daemon=True).start()
     threading.Thread(target=motor_keepalive_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    app.run(host=os.environ.get("APP_HOST", "0.0.0.0"),
+            port=int(os.environ.get("APP_PORT", "5000")),
+            threaded=True, debug=False, use_reloader=False)

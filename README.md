@@ -1,726 +1,288 @@
-# Microcontroller-Based CAN IDS Integration in Multi-ECU HIL Environment
+# CAN IDS — Raspberry Pi + ESP32 laboratory testbed
 
-<p align="center">
-  <img src="docs/images/hardware-setup-1.jpeg" alt="CAN IDS HIL Project" width="80%">
-</p>
+A Raspberry Pi gateway controls three ESP32 ECUs over CAN at 500 kbit/s. Its Flask dashboard shows heartbeats, distance sensors, motor/lock state and the IDS countdown. Use Windows Terminal, PuTTY, Raspberry Pi Connect or VS Code to work on the same Pi checkout.
 
-<p align="center">
-  <strong>A Raspberry Pi 5-based automotive cybersecurity Hardware-in-the-Loop (HIL) project</strong><br>
-  <em>Real-time intrusion detection in CAN bus networks using Machine Learning</em>
-</p>
+![Vehicle prototype with Raspberry Pi, CAN modules and sensors](docs/images/hardware-setup-1.jpeg)
 
-<p align="center">
-  <a href="#overview">Overview</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#usage">Usage</a> •
-  <a href="#ml-model-training">ML Training</a> •
-  <a href="#documentation">Documentation</a>
-</p>
+**Start here:** [Connect to the Pi](#1-connect-to-the-pi) · [Install](#2-install-on-the-pi) · [Wi-Fi](#3-configure-wi-fi-from-env) · [CAN](#4-bring-up-can) · [Dashboard](#5-use-the-web-interface) · [Remote development](#6-edit-in-vs-code-and-deploy) · [Troubleshooting](#troubleshooting)
 
----
+## What the current code implements
 
-## Team
+| Component | Current behavior |
+|---|---|
+| Live gateway | Root `app.py`; Flask dashboard, SocketCAN RX/TX, node tracking and control |
+| Rule mode (ML off) | Detects the **configured demo client**, or a registered USB demo whose configured destination responds to a ping |
+| ML mode (toggle on) | Isolation Forest replaces the rule trigger; eight features over a two-second CAN window |
+| State machine | `NORMAL → COUNTDOWN → BLOCKED`; condition must clear for the rearm cooldown |
+| Network containment | HTTP 403 on the blocked client's joystick/solenoid requests; monitoring and SSH stay reachable |
+| CAN containment | Stops the motor and refuses all joystick/solenoid requests while contained; it does not filter CAN frames on the wire |
+| Control loss | Pi stops stale joystick commands after `JOYSTICK_TIMEOUT`; Motor ECU also has a 500 ms CAN-command timeout |
+| Offline code | `ids/` contains training/evaluation utilities, including Random Forest; those bundles are not the live gateway's model format |
 
-👥 **Project Team**:
-- 240371610621011 – **Barath Raj B**
-- 240371610621020 – **Hari Prasanth S T**
-- 240371610621030 – **Mathumitha E**
-- 240371610621035 – **Muthuraman M** (Repository Maintainer)
-- 240371610621059 – **Vishal SR**
+This is a lab demonstration, with no measured accuracy or inference-latency claim. MQTT, key rotation and rolling-counter authentication are not implemented. A known client's presence is a demonstration trigger, not a general classifier of malicious Wi-Fi activity. The dashboard has no user login; keep it on the trusted test network.
 
-## Project Resources
-
-<p align="center">
-  <a href="https://drive.google.com/file/d/1OOLmNXR9Jynrfqxy_38ZL4V1NH05aDwa/view?usp=sharing">
-    <img src="https://img.shields.io/badge/Google_Drive-Project_Materials-4285F4?style=for-the-badge&logo=googledrive&logoColor=white" alt="Google Drive">
-  </a>
-  <img src="https://img.shields.io/badge/Platform-Raspberry_Pi_5-C51A4A?style=for-the-badge&logo=raspberrypi&logoColor=white" alt="Raspberry Pi">
-  <img src="https://img.shields.io/badge/ML-Scikit_Learn-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white" alt="Scikit-learn">
-  <img src="https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
-</p>
-
-**📁 Resources**:
-- 📂 [**Google Drive**](https://drive.google.com/file/d/1OOLmNXR9Jynrfqxy_38ZL4V1NH05aDwa/view?usp=sharing) - Additional materials and demo videos
-- 📷 **Hardware Photos** - `docs/images/` (5 setup photos)
-- 📄 **Documentation** - Complete guides in `docs/`
-- 🎥 **Demo Videos** - Available in project archive
-
----
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Hardware Requirements](#hardware-requirements)
-4. [Software Requirements](#software-requirements)
-5. [Installation](#installation)
-6. [Configuration](#configuration)
-7. [Usage](#usage)
-8. [ML Model Training](#ml-model-training)
-9. [Attack Demonstration](#attack-demonstration)
-10. [Troubleshooting](#troubleshooting)
-11. [Project Structure](#project-structure)
-12. [Documentation](#documentation)
-13. [Safety and Ethics](#safety-and-ethics)
-
----
-
-## Overview
-
-This project implements a comprehensive **intrusion detection system (IDS)** for automotive CAN networks using machine learning models running on a Raspberry Pi 5. The system demonstrates real-time detection and response to various attack vectors including:
-
-- **CAN bus attacks** (flooding, spoofing, payload anomalies)
-- **Network-based attacks** (unauthorized Wi-Fi clients)
-- **USB-based attack vectors** (controlled demonstration)
-
-### Key Features
-
-- **Dual ML Models**: Isolation Forest (unsupervised) and Random Forest (supervised)
-- **Real-time Detection**: Sub-100ms inference on Raspberry Pi 5
-- **Multi-ECU HIL**: Three ESP32-based ECUs (Motor, Sensor, Security)
-- **Live Dashboard**: Web-based control and monitoring interface
-- **Isolation Mechanism**: Application-layer blocking with safe state enforcement
-- **Laboratory-safe**: Controlled demonstrations for educational purposes
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    RASPBERRY PI 5 GATEWAY                    │
-│                                                               │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐ │
-│  │ Flask Server │  │  IDS Engine  │  │  Security Policy   │ │
-│  │  Dashboard   │──│  (ML Models) │──│      Engine        │ │
-│  └──────────────┘  └──────────────┘  └────────────────────┘ │
-│         │                  │                     │            │
-│  ┌──────┴──────┬──────────┴───────┬─────────────┴──────┐    │
-│  │   CAN Bus   │   Wi-Fi AP       │   USB Monitor       │    │
-│  │  (MCP2515)  │   (wlan1)       │   (udev trigger)    │    │
-│  └──────┬──────┴──────────┬───────┴─────────────────────┘    │
-└─────────┼─────────────────┼──────────────────────────────────┘
-          │                 │
-    ┌─────┴────┐      ┌────┴──────┐
-    │ CAN Bus  │      │ Attacker  │
-    │ (500kbps)│      │ (Network) │
-    └────┬─────┘      └───────────┘
-         │
-   ┌─────┴──────┬──────────┬────────────┐
-   │   Motor    │  Sensor  │  Security  │
-   │   ECU      │  ECU     │  ECU       │
-   │  (ESP32)   │ (ESP32)  │  (ESP32)   │
-   └────────────┴──────────┴────────────┘
+```mermaid
+flowchart TD
+  Browser["Browser dashboard"] --> Pi["Raspberry Pi: Flask and IDS"]
+  WiFi["Dedicated Wi-Fi AP and registered USB demo"] --> Pi
+  Pi <--> Bus["CAN bus: 500 kbit/s"]
+  Bus <--> Motor["ESP32 Motor ECU"]
+  Bus <--> Sensor["ESP32 Sensor ECU"]
+  Bus <--> Lock["ESP32 Security ECU"]
 ```
 
-### Detection Flow
+## 1. Connect to the Pi
 
-```
-CAN / Wi-Fi / USB Traffic
-        ↓
-  Telemetry Collection
-        ↓
- Feature Extraction
-        ↓
-  Preprocessing
-        ↓
-  ┌─────┴──────┐
-  ↓            ↓
-Isolation  Random
-Forest     Forest
-  ↓            ↓
-  └─────┬──────┘
-        ↓
-  Security Policy
-        ↓
-  ┌─────┴──────┐
-  ↓            ↓
-ALLOW       ISOLATE
-           ↓
-      Safe State
-           ↓
-    Dashboard + Log
+In Raspberry Pi Imager, set a username, hostname such as `vehicle-pi`, home Wi-Fi credentials and country, and enable SSH. `piuser` below means **the username you created**, not a required/default account. Keep the Pi on home Wi-Fi (`wlan0`) or Ethernet for development; reserve a second Wi-Fi adapter (`wlan1`) for the lab AP.
+
+### Windows CMD, PowerShell or Windows Terminal
+
+```powershell
+ssh piuser@vehicle-pi.local
 ```
 
----
+If `.local` does not resolve, use the Pi IPv4 from your router's client list, e.g. `ssh piuser@192.168.1.50`. Verify the SSH host fingerprint when first connecting. If SSH was not enabled, use a Pi-local terminal to run `sudo systemctl enable --now ssh`.
 
-## Hardware Requirements
+For dashboard access through an SSH tunnel, leave this Windows terminal open:
 
-### Required Components
+```powershell
+ssh -L 5000:127.0.0.1:5000 piuser@vehicle-pi.local
+```
 
-1. **Raspberry Pi 5** (4GB+ RAM recommended)
-   - Power supply (27W USB-C)
-   - MicroSD card (32GB+ Class 10)
-   - Heat sinks / active cooling
+Open <http://localhost:5000> on Windows. Change both port numbers if `APP_PORT` changes.
 
-2. **MCP2515 CAN Controller Module** (×1)
-   - SPI interface to Raspberry Pi
-   - 8MHz crystal oscillator
-   - TJA1050 CAN transceiver
+### PuTTY
 
-3. **ESP32 Development Boards** (×3)
-   - Motor ECU
-   - Sensor ECU
-   - Security ECU
+1. Set **Host Name** to `vehicle-pi.local` or the Pi IPv4, **Port** to `22`, **Connection type** to SSH.
+2. Optionally save the session as `Vehicle Pi`. Open it and log in as your Pi user.
+3. Run the same Linux commands below. For a tunnel, before opening the session go to **Connection → SSH → Tunnels**, source port `5000`, destination `127.0.0.1:5000`, choose **Local**, then **Add**.
 
-4. **CAN Bus Components**
-   - CAN H/L wiring
-   - 120Ω termination resistors (×2)
+### Raspberry Pi Connect (browser terminal)
 
-5. **Wi-Fi USB Adapter** (×1)
-   - For dedicated Vehicle-IDS AP (wlan1)
-   - Must support AP mode
-   - Recommended: RT5370/RT3070 chipset
+On the Pi, check `rpi-connect --version`. If absent, install the matching package: `sudo apt install rpi-connect-lite` on Raspberry Pi OS Lite (remote shell), or `sudo apt install rpi-connect` on Desktop (shell and supported screen sharing). Then run as the normal Pi user:
 
-6. **Additional Peripherals**
-   - Motor driver board (L298N or similar)
-   - DC motors (×4)
-   - VL53L0X ToF distance sensor
-   - HC-SR04 ultrasonic sensors (×2)
-   - Solenoid lock
+```bash
+rpi-connect on
+rpi-connect signin
+rpi-connect status
+```
 
-7. **Development/Testing**
-   - Attacker laptop (for demonstration)
-   - USB flash drive (for controlled demo)
+Follow the sign-in link, visit <https://connect.raspberrypi.com>, choose the Pi and **Remote shell**. Use the installation, Git and service commands below in that shell. For a headless Pi that must remain available after logout: `sudo loginctl enable-linger "$USER"`.
 
-### Wiring Connections
+Connect remote shell does **not** publish the Flask dashboard to your Windows browser. Access it on your LAN, through a reachable SSH/VPN tunnel, or open the Pi's own browser through Connect screen sharing on a supported desktop. Check state from Connect shell with `curl http://127.0.0.1:5000/api/state`.
 
-#### Raspberry Pi → MCP2515 (SPI)
-- VCC → 3.3V (Pin 1)
-- GND → Ground (Pin 6)
-- CS → GPIO 8 (Pin 24)
-- SO → GPIO 9/MISO (Pin 21)
-- SI → GPIO 10/MOSI (Pin 19)
-- SCK → GPIO 11/SCLK (Pin 23)
-- INT → GPIO 25 (Pin 22)
+## 2. Install on the Pi
 
-#### ESP32 → MCP2515 (Each ECU)
-- CS → GPIO 5
-- SO → GPIO 19
-- SI → GPIO 23
-- SCK → GPIO 18
-- INT → GPIO 4
+Commands in `bash` blocks run **on the Pi**, including SSH, PuTTY or Connect shell. Use Raspberry Pi OS Bookworm or later; Python 3.11+ is the intended baseline.
 
-*See `docs/wiring.md` for complete wiring diagrams.*
-
-### Hardware Setup Photos
-
-Physical hardware setup images showing the complete HIL testbed:
-
-<p align="center">
-  <img src="docs/images/hardware-setup-1.jpeg" alt="Complete HIL Testbed" width="45%">
-  <img src="docs/images/hardware-setup-2.jpeg" alt="CAN Bus Wiring" width="45%">
-</p>
-
-<p align="center">
-  <img src="docs/images/hardware-setup-3.jpeg" alt="ESP32 ECU Connections" width="45%">
-  <img src="docs/images/hardware-setup-4.jpeg" alt="MCP2515 Integration" width="45%">
-</p>
-
-<p align="center">
-  <img src="docs/images/hardware-setup-5.jpeg" alt="Raspberry Pi Gateway" width="45%">
-</p>
-
-**Photos show**:
-- ✅ Complete HIL testbed assembly
-- ✅ CAN bus wiring and termination
-- ✅ ESP32 ECU placement and connections
-- ✅ MCP2515 CAN controller integration
-- ✅ Raspberry Pi 5 gateway setup with interfaces
-
----
-
-## Software Requirements
-
-### Operating System
-- **Raspberry Pi OS** (64-bit, Bookworm or later)
-- Kernel with SocketCAN support (pre-installed on modern Pi OS)
-
-### System Packages
 ```bash
 sudo apt update
-sudo apt install -y \\
-    python3 python3-pip python3-venv \\
-    can-utils \\
-    hostapd dnsmasq \\
-    git
-```
-
-### Python Dependencies
-See `requirements.txt`. Key packages:
-- Flask (web framework)
-- python-can (CAN bus)
-- scikit-learn (ML models)
-- numpy, pandas (data processing)
-- python-dotenv (configuration)
-
----
-
-## Installation
-
-### 1. Clone/Extract Repository
-```bash
-cd ~
-# If from ZIP:
-unzip car-ids-hil-github-ready.zip
-cd car-ids-hil
-
-# If from Git:
-git clone https://github.com/yourusername/car-ids-hil.git
-cd car-ids-hil
-```
-
-### 2. Run Setup Script
-```bash
-chmod +x scripts/setup.sh
-sudo ./scripts/setup.sh
-```
-
-This script will:
-- Install system dependencies
-- Create Python virtual environment
-- Install Python packages
-- Configure CAN interface
-- Set up network (dnsmasq, hostapd)
-- Install USB demo trigger (if requested)
-- Copy example configuration
-
-### 3. Configure Environment
-```bash
-cp .env.example .env
+sudo apt install -y git python3-venv python3-pip can-utils iproute2 iw network-manager
+git clone https://github.com/Muthuram30/Can_ids.git ~/Can_ids
+cd ~/Can_ids
+bash scripts/setup.sh
 nano .env
 ```
 
-**Critical settings to update:**
+Set real Wi-Fi credentials and the designated demo-client address in `.env`. Values containing spaces or `#` must be quoted, e.g. `HOME_PASSWORD="a space # password"`. The Python entry points load this file directly; exported environment variables take precedence. Do not run `source .env` or `export $(cat .env | xargs)`.
+
 ```bash
-# Wi-Fi AP
-AP_SSID=Vehicle-IDS-AP
-AP_PASSWORD=your_secure_password
-
-# Attacker configuration (for demo)
-ATTACKER_IP=10.50.0.100
-ATTACKER_MAC=aa:bb:cc:dd:ee:ff  # Optional
-
-# USB device (for demo)
-USB_VENDOR_ID=0781  # Your USB stick
-USB_PRODUCT_ID=5581
-USB_SERIAL=123456789
-
-# ML model
-IDS_MODEL=isolation_forest
-ML_ENABLED=false
+bash scripts/runner.sh
 ```
 
-### 4. Configure Raspberry Pi Boot
-Edit `/boot/firmware/config.txt` (or `/boot/config.txt` on older systems):
+The dashboard starts even with no CAN adapter, AP or model present. It reports those as unavailable; this does not demonstrate hardware operation. Press Ctrl+C to stop. Installation uses `.venv`, without `--break-system-packages` or changes to global Python dependencies.
+
+## 3. Configure Wi-Fi from .env
+
+**Home Wi-Fi:** normally set this in Imager. To change it later, set `HOME_IFACE`, `HOME_SSID` and `HOME_PASSWORD` in `.env`, then run the following from a local terminal or Ethernet session; changing the interface carrying SSH can disconnect that session.
+
 ```bash
-sudo nano /boot/firmware/config.txt
+cd ~/Can_ids
+sudo raspi-config nonint do_wifi_country IN
+sudo .venv/bin/python scripts/setup_wifi.py home
 ```
 
-Add:
+Use your actual country instead of `IN` outside India. `WIFI_COUNTRY` in `.env` is a reminder; `raspi-config` sets the OS regulatory country.
+
+**Lab AP:** plug in an AP-capable second Wi-Fi adapter. Confirm its name using `nmcli device status` and AP capability using `iw list`; interface names may differ from `wlan1`. Set `AP_IFACE` accordingly, keep it different from `HOME_IFACE`, and set `AP_SSID`, a real `AP_PASSWORD`, and `AP_IP=10.50.0.1`.
+
+```bash
+iw list
+.venv/bin/python scripts/setup_wifi.py status
+sudo .venv/bin/python scripts/setup_wifi.py ap
 ```
+
+The helper creates only the `vehicle-ids-ap` NetworkManager profile, with WPA2, DHCP/shared networking, a `/24` address and automatic reconnect. It does not reconfigure the management adapter. Leave `AUTO_FIX_AP=0`; the old hostapd repair mode must not compete with NetworkManager. If migrating an existing hostapd/dnsmasq lab AP, see [the network guide](docs/network-and-remote-access.md#existing-hostapddnsmasq-setups) before enabling the new one.
+
+Join `Vehicle-IDS-AP` on the demo laptop. In **Windows**, run `ipconfig` and copy that adapter's IPv4 (not the home-Wi-Fi address) into `ATTACKER_IP` in the **Pi's `.env`**. Restart the app. DHCP may assign an address other than `.100`; do not assume that default is correct. Optional `ATTACKER_MAC` tracks the chosen client if its IPv4 changes; use the MAC reported for this AP, accounting for Windows randomized addresses.
+
+Open <http://10.50.0.1:5000> from the AP client. To stop only this project's hotspot:
+
+```bash
+sudo .venv/bin/python scripts/setup_wifi.py down
+```
+
+## 4. Bring up CAN
+
+Hardware: Raspberry Pi, three ESP32 boards, a CAN controller/transceiver at each node, appropriate motor/lock drivers, sensors, common ground and two 120 Ω terminators (one at each bus end). All firmware uses 500 kbit/s. Check each board's actual oscillator; the Pi controller's crystal is independent of an ESP32 module's crystal.
+
+For the Pi SPI0 MCP2515 connection:
+
+| Signal | Pi physical pin | BCM GPIO |
+|---|---:|---:|
+| MOSI | 19 | 10 |
+| MISO | 21 | 9 |
+| SCLK | 23 | 11 |
+| CE0/CS | 24 | 8 |
+| INT | 22 | 25 |
+| Ground | 6 | GND |
+
+Use a Pi-compatible 3.3 V logic interface. Common 5 V MCP2515/TJA1050 boards may need separate supplies or level shifting; do not assume their VCC or MISO is Pi-safe. Power motors/solenoid through their drivers, not Pi GPIO.
+
+Edit `/boot/firmware/config.txt` (or the boot configuration path for your OS). For a **verified 8 MHz Pi-side module** with INT on GPIO25:
+
+```ini
 dtparam=spi=on
 dtoverlay=mcp2515-can0,oscillator=8000000,interrupt=25
 ```
 
-Reboot:
-```bash
-sudo reboot
-```
-
-### 5. Upload ESP32 Firmware
-Using Arduino IDE:
-1. Install ESP32 board support
-2. Install library: `mcp_can` (Seeed Studio)
-3. Open `esp32/Motor_ECU_Node.ino`
-4. Select board: ESP32 Dev Module
-5. Upload to first ESP32
-6. Repeat for Sensor and Security ECUs
-
----
-
-## Configuration
-
-### CAN Bus
-Default: **500 kbps**, standard (11-bit) IDs
-
-To change bitrate, edit `.env`:
-```bash
-CAN_BITRATE=250000  # or 125000, 500000, 1000000
-```
-
-### Network / Access Point
-The system uses **wlan1** for the dedicated Vehicle-IDS AP, leaving **wlan0** for normal connectivity.
-
-Configuration files:
-- `config/dnsmasq.conf`
-- `config/hostapd.conf`
-
-Apply changes:
-```bash
-sudo systemctl restart hostapd dnsmasq
-```
-
-### IDS Thresholds
-In `.env`:
-```bash
-# Isolation Forest
-ISOLATION_CONTAMINATION=0.02
-IDS_THRESHOLD=0.0  # Scores below this = anomaly
-
-# Random Forest
-RF_CONFIDENCE_THRESHOLD=0.7
-
-# Response timing
-BLOCK_DELAY=18  # Countdown seconds
-REARM_COOLDOWN=5
-```
-
----
-
-## Usage
-
-### Normal Startup
-```bash
-cd ~/car-ids-hil
-./scripts/start.sh
-```
-
-Access dashboard:
-- **From operator network** (wlan0): `http://<pi-wlan0-ip>:5000`
-- **From Vehicle-IDS AP**: `http://10.50.0.1:5000`
-
-### Full System Check
-```bash
-./scripts/check_system.sh
-```
-
-Verifies:
-- Python environment
-- CAN interface (can0)
-- Wi-Fi interfaces
-- Network services (hostapd, dnsmasq)
-- USB trigger service
-
-### Complete Reinitialization
-```bash
-./scripts/runner.sh
-```
-
-Use this when:
-- Wi-Fi dongle was reconnected
-- CAN interface needs reset
-- Services need restart
-
-### Stop Services
-```bash
-./scripts/stop.sh
-```
-
-### Reset to Clean State
-```bash
-./scripts/reset.sh
-```
-
----
-
-## ML Model Training
-
-The system supports two models:
-
-### Isolation Forest (Unsupervised)
-Trained on **normal traffic only**. Detects anomalies without labeled attack data.
+Reboot, then:
 
 ```bash
-python3 -m ids.train --model isolation_forest --sim-hours 2.0
+cd ~/Can_ids
+bash can/can0_setup.sh can0 500000
+ip -details -statistics link show can0
+candump can0
 ```
 
-Output:
-- `models/isolation_forest.joblib`
-- `models/preprocessor.joblib`
+Stop `candump` with Ctrl+C. Use the matching channel in `.env`. Bring CAN up again after reboot unless you have configured an OS CAN service. Flash each sketch under `esp32/` separately with Arduino IDE and its required libraries. Each sketch must live in its own same-named Arduino sketch folder. ESP32 pin definitions and sensor libraries are in those files; a Git pull on the Pi **does not flash ESP32 firmware**.
 
-### Random Forest (Supervised)
-Requires **labeled data** (normal + attacks).
+See [CAN ID map and firmware notes](docs/hardware-and-can.md).
+
+## 5. Use the web interface
+
+1. Start the app, then open `http://PI_LAN_IP:5000` on the home network, `http://10.50.0.1:5000` on the lab AP, or `http://localhost:5000` through the SSH tunnel.
+2. Check motor/sensor/security node dots and distances. Missing heartbeats go offline after two seconds. Check `can_up` in `/api/state` if hardware is absent.
+3. Drag and **hold** the joystick to move; release, cancel, switch away or lose the browser connection to stop. The browser refreshes the held position every 200 ms. Test with wheels raised first.
+4. Use lock ON/OFF for the security ECU. The response confirms the request, not physical actuation; verify the returned lock status.
+5. Keep **ML off** for the Wi-Fi/USB demo. The designated AP client's presence starts the countdown; controls from that client return HTTP 403 after the delay. Disconnect it and wait `REARM_COOLDOWN` seconds for rearm.
+6. For the CAN ML demo, first generate the compatible model, then enable the ML toggle. While enabled, CAN anomaly scoring replaces the Wi-Fi/USB trigger. A sustained anomaly leads to motor stop and global control refusal until the condition clears and rearm completes.
 
 ```bash
-python3 -m ids.train --model random_forest --data data/labeled_traffic.csv
+cd ~/Can_ids
+.venv/bin/python train_can_ids_model.py
 ```
 
-Output:
-- `models/random_forest.joblib`
-- `models/rf_preprocessor.joblib`
+The trainer creates a **synthetic baseline** model at `can_ids_model.joblib` (ignored by Git). It is a smoke-test model, not a validated detector for your physical traffic. Keep the live model path consistent with `ML_MODEL_PATH`; changing hardware traffic requires proper data collection and validation. Never load an untrusted joblib file.
 
-### Model Evaluation
+The optional USB demonstration needs explicit registration and installation: [USB guide](docs/usb-demo.md). It executes a fixed repository script, never files from the inserted drive.
+
+## 6. Edit in VS Code and deploy
+
+### Recommended: edit directly on the Pi using Remote SSH
+
+Install VS Code's **Remote - SSH** extension on Windows. Choose **Remote-SSH: Connect to Host…**, enter `piuser@vehicle-pi.local`, then open `/home/piuser/Can_ids`. Select `.venv/bin/python` in the remote Python extension. Every saved edit is already on the Pi; no ZIP or copy step is required. VS Code's integrated terminal is now a **Pi shell**.
+
 ```bash
-python3 -m ids.evaluate \\
-    --model models/isolation_forest.joblib \\
-    --type isolation_forest \\
-    --test-data data/test.csv
+cd ~/Can_ids
+.venv/bin/python -m unittest discover -s tests -v
+git status --short
+git add -A
+git diff --cached
+git commit -m "Describe the CAN IDS change"
+git push origin main
+systemctl --user restart vehicle-ids.service
 ```
 
-### Switching Models at Runtime
-Via dashboard: Toggle "ML Detection" switch
+Run the restart only if you installed the service below; otherwise stop and restart `scripts/runner.sh`. A save does not automatically restart the hardware controller. `.env`, models, logs and runtime files are ignored. Review the staged diff before committing. GitHub HTTPS pushes require authentication (a token/credential manager), or use a GitHub SSH key; do not put tokens into `.env` or the remote URL.
 
-Or edit `.env` and restart:
+### Alternative: edit locally on Windows, push, then update the Pi
+
+Commit and push from your local VS Code checkout, then run **in PowerShell**:
+
+```powershell
+git push origin main
+.\scripts\deploy.ps1 -PiHost piuser@vehicle-pi.local
+```
+
+This requires the Pi checkout at `~/Can_ids`. The helper checks that the local commit equals `origin/main`, connects over SSH, checks that the Pi has a clean `main` checkout, makes a backup branch, fast-forwards to that exact commit, installs requirements, runs tests and restarts a running user service. It stops on divergence or failure; it never resets/discards Pi edits. PowerShell may require `powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1 -PiHost piuser@vehicle-pi.local` for that invocation.
+
+From PuTTY or Connect shell, the equivalent is:
+
 ```bash
-IDS_MODEL=random_forest  # or isolation_forest
+cd ~/Can_ids
+bash scripts/update.sh
 ```
 
----
+Use one editing workflow at a time to avoid conflicts. A commit alone does not deploy a local Windows file; either edit the remote checkout or push and run the deployment helper.
 
-## Attack Demonstration
+## 7. Run automatically after boot
 
-⚠️ **Laboratory Use Only** ⚠️
+Stop any foreground app first; two instances would compete for port 5000 and send duplicate CAN traffic.
 
-All attack demonstrations are controlled and contained within the project's own testbed.
-
-### Network Attack (Wi-Fi)
-1. **Attacker** connects to Vehicle-IDS AP
-2. **IDS** detects unauthorized MAC/IP
-3. **System** enters countdown (18s default)
-4. **IDS** blocks attacker (HTTP 403 on control endpoints)
-5. **Dashboard** shows UNSAFE→SAFE transition
-
-### CAN Attack (Flooding/Spoofing)
-Simulated via script or manual injection:
 ```bash
-# Send flood on 0x100
-for i in {1..1000}; do
-    cansend can0 100#FF00000000000000
-done
+cd ~/Can_ids
+bash scripts/install_service.sh
+sudo loginctl enable-linger "$USER"
+systemctl --user status vehicle-ids.service
+journalctl --user -u vehicle-ids.service -f
 ```
 
-**IDS** detects rate/ID/payload anomaly → Safe state (motors stop)
-
-### USB Attack Vector
-1. Insert **registered** USB device (matched by vendor/product/serial)
-2. **udev** triggers `usb_attack_trigger.py`
-3. **Payload** (`usb_attack_demo.py`) attempts connection to ATTACKER_IP
-4. **IDS** detects network activity → Isolation → Payload terminated
-
----
+This generates a service with your actual checkout path and user. It runs Flask as that user and loads `.env` through Python. It does not start a root web server or alter your network on each boot. CAN must be configured separately. After a `.env` edit: `systemctl --user restart vehicle-ids.service`.
 
 ## Troubleshooting
 
-### CAN Interface Not Found
+| Symptom | Check or action |
+|---|---|
+| `vehicle-pi.local` not found | Use the router-assigned IPv4; ensure client isolation is disabled on the management LAN |
+| SSH connection refused | Enable SSH locally/in Imager; check Pi power, LAN and port 22 |
+| Page unavailable | `systemctl --user status vehicle-ids.service`; `ss -ltnp`; correct `APP_PORT`; avoid running two apps |
+| `TemplateNotFound` | Run root `app.py`; `templates/dashboard.html` must exist alongside it |
+| `.env` appears ignored | Restart; exported variables override `.env`; the runner prints no passwords |
+| `can0` missing | Check SPI overlay, actual crystal, INT wiring and reboot; `dmesg` and `ip link` |
+| CAN bus-off/no node data | Match 500 kbit/s, common ground, H/L and two terminators; inspect CAN statistics |
+| AP helper fails | Verify AP support/driver, actual interface name, country and NetworkManager; avoid legacy daemon conflicts |
+| Wi-Fi demo never starts | Set the AP-client IPv4/MAC, restart; inspect `ip neigh show dev wlan1` and `iw dev wlan1 station dump` |
+| hostapd/dnsmasq false in JSON | Expected when NetworkManager owns the AP; interface state and client reachability determine operation |
+| ML unavailable | Run the root trainer in `.venv`, check `ML_MODEL_PATH`; offline `ids.train` outputs are incompatible |
+| PuTTY/SSH closes and app stops | Use the user service; enable lingering for boot/logout operation |
+| Git push rejected | Authenticate, fetch and inspect history; resolve divergence without force-pushing |
+
+## Files, evidence and backup
+
+| Path | Purpose |
+|---|---|
+| `app.py`, `templates/`, `can_features.py` | Live controller, dashboard and shared live/training features |
+| `train_can_ids_model.py` | Compatible synthetic-baseline trainer |
+| `esp32/`, `can/` | Firmware and Pi CAN link setup |
+| `scripts/` | Installation, networking, service generation, deployment and health checks |
+| `usb/` | Optional fixed lab payload and registered-device monitor |
+| `ids/`, `data/`, `models/` | Separate offline training/evaluation code and data/model notes |
+| `tests/` | Hardware-independent Flask, CAN and configuration checks |
+| `docs/` | Hardware photos, operating guides, historical comparisons and verification limits |
+
+The original public version is commit [`711fa37`](https://github.com/Muthuram30/Can_ids/commit/711fa37a542bc292c766dbe3a42093cf5a9e6557). A local backup branch `backup/before-pi-integration-20261122` and a Git bundle preserve it. This does not imply that the backup branch was published. Inspect it without overwriting your working copy:
+
 ```bash
-# Check dmesg for MCP2515
-dmesg | grep -i mcp251x
-
-# Verify SPI enabled
-ls /dev/spidev0.0
-
-# Manually bring up
-sudo ip link set can0 type can bitrate 500000
-sudo ip link set can0 up
+git show 711fa37:README.md
+git switch -c inspect-original 711fa37
+git switch main
 ```
 
-### Wi-Fi AP Not Broadcasting
-```bash
-# Check hostapd
-sudo systemctl status hostapd
-sudo journalctl -u hostapd -n 50
+The GitHub tree already contained no ZIP files. The update removes the unused `app/` Flask stub, moves its working dashboard into `templates/`, and replaces obsolete hard-coded setup/service files with generated per-device configuration. No original local project folders or archives need deleting.
 
-# Test configuration
-sudo hostapd -dd /etc/hostapd/hostapd.conf
+**Validation:** [test results and Pi-only checks](docs/verification.md). Historical `implementation-comparison.md` and `reference-comparison.md` are design context, not measured validation of this version.
 
-# Check interface
-ip addr show wlan1
-```
+## Hardware gallery
 
-### IDS Not Detecting
-```bash
-# Check model files exist
-ls -lh models/
+![Prototype wiring and CAN hardware, second view](docs/images/hardware-setup-2.jpeg)
 
-# Verify ML toggle state
-curl http://localhost:5000/api/state | jq '.security.ml'
+More original images: [view 3](docs/images/hardware-setup-3.jpeg), [view 4](docs/images/hardware-setup-4.jpeg), [view 5](docs/images/hardware-setup-5.jpeg).
 
-# Check logs
-tail -f logs/app.log
-```
+## Team
 
-### USB Trigger Not Firing
-```bash
-# Check udev rule
-ls -l /etc/udev/rules.d/99-vehicle-usb-demo.rules
+Barath Raj B · Hari Prasanth S T · Mathumitha E · **Muthuraman M (repository maintainer)** · Vishal SR.
 
-# Test USB identity
-udevadm info -a -n /dev/sda | grep -E 'idVendor|idProduct|serial'
+[Additional project materials](https://drive.google.com/file/d/1OOLmNXR9Jynrfqxy_38ZL4V1NH05aDwa/view) · [License](LICENSE)
 
-# Monitor udev
-udevadm monitor
-```
-
-*See `docs/troubleshooting.md` for complete guide.*
-
----
-
-## Project Structure
-
-```
-car-ids-hil/
-├── README.md                 # This file
-├── LICENSE                   # MIT License
-├── .env.example              # Configuration template
-├── .gitignore
-├── requirements.txt          # Python dependencies
-├── requirements-dev.txt      # Development dependencies
-│
-├── app.py                    # Main Flask application (working)
-├── train_can_ids_model.py    # Legacy training script
-├── can_features.py           # Legacy feature extraction
-│
-├── app/                      # Modular Flask app (in progress)
-│   ├── __init__.py
-│   ├── app.py
-│   ├── templates/
-│   │   └── dashboard.html
-│   └── static/
-│
-├── ids/                      # Intrusion Detection System
-│   ├── __init__.py
-│   ├── feature_extraction.py
-│   ├── preprocessing.py
-│   ├── train.py              # Training pipeline
-│   ├── evaluate.py           # Model evaluation
-│   ├── collect_telemetry.py
-│   ├── policy_engine.py      # Security policy
-│   └── models/
-│       ├── __init__.py
-│       ├── base_model.py
-│       ├── isolation_forest_model.py
-│       ├── random_forest_model.py
-│       └── model_factory.py
-│
-├── can/                      # CAN bus utilities
-│   └── can0_setup.sh
-│
-├── network/                  # Network configuration
-│
-├── usb/                      # USB attack demo
-│   ├── usb_attack_trigger.py
-│   └── usb_attack_demo.py
-│
-├── esp32/                    # ESP32 ECU firmware
-│   ├── Motor_ECU_Node.ino
-│   ├── Sensor_ECU_Node.ino
-│   └── Security_ECU_Node.ino
-│
-├── config/                   # Configuration templates
-│
-├── scripts/                  # Management scripts
-│   ├── setup.sh              # One-time setup
-│   ├── runner.sh             # Complete initialization
-│   ├── start.sh              # Start services
-│   ├── stop.sh               # Stop services
-│   ├── reset.sh              # Reset state
-│   └── check_system.sh       # System verification
-│
-├── systemd/                  # systemd service files
-│   ├── vehicle-usb-attack.service
-│   └── vehicle-usb-attack-remove.service
-│
-├── udev/                     # udev rules
-│   └── 99-vehicle-usb-demo.rules
-│
-├── models/                   # Trained ML models (generated)
-│   └── README.md
-│
-├── data/                     # Training/test data
-│   ├── normal/
-│   ├── attack/
-│   ├── processed/
-│   └── README.md
-│
-├── docs/                     # Documentation
-│   ├── architecture.md
-│   ├── installation.md
-│   ├── configuration.md
-│   ├── ml-pipeline.md
-│   ├── ml-model-comparison.md
-│   ├── attack-demo.md
-│   ├── troubleshooting.md
-│   ├── implementation-comparison.md
-│   └── reference-comparison.md
-│
-├── tests/                    # Unit tests
-│   ├── ids/
-│   └── can/
-│
-└── reports/                  # Generated reports
-```
-
----
-
-## Documentation
-
-Detailed documentation available in `docs/`:
-
-- **[architecture.md](docs/architecture.md)** - System architecture and design
-- **[installation.md](docs/installation.md)** - Complete installation guide
-- **[ml-pipeline.md](docs/ml-pipeline.md)** - ML training and inference
-- **[ml-model-comparison.md](docs/ml-model-comparison.md)** - IF vs RF analysis
-- **[attack-demo.md](docs/attack-demo.md)** - Attack demonstration procedures
-- **[troubleshooting.md](docs/troubleshooting.md)** - Common issues and solutions
-
----
-
-## Safety and Ethics
-
-### Laboratory Use Only
-
-This project is designed for **controlled educational demonstrations** in a laboratory environment:
-
-- ✅ Demonstrations run on **isolated test network**
-- ✅ Attack payloads are **fixed and documented**
-- ✅ No real vehicle systems are targeted
-- ✅ All actions are **logged and auditable**
-
-### Prohibited Uses
-
-❌ **DO NOT**:
-- Deploy on production vehicle networks
-- Use attack techniques outside controlled testbed
-- Modify payloads for malicious purposes
-- Test on networks you don't own
-- Bypass safety interlocks
-
-### Responsible Disclosure
-
-Security vulnerabilities discovered should be:
-1. Documented in laboratory notes
-2. Reported to course instructor
-3. Not disclosed publicly without review
-
----
-
-## License
-
-MIT License - See [LICENSE](LICENSE) file
-
----
-
-## Acknowledgments
-
-This project was developed as part of a technical hackathon focused on automotive cybersecurity. Special thanks to:
-
-- Faculty advisors and mentors
-- Open-source community (scikit-learn, Flask, python-can)
-- Reference implementations and research papers
-
----
-
-## Contact
-
-For questions about this project:
-- **Academic inquiries**: Contact team members via institutional email
-- **Technical issues**: Open an issue on the project repository
-- **Security concerns**: Follow responsible disclosure process
-
----
-
-**Version**: 1.0.0  
-**Last Updated**: 2024  
-**Status**: Laboratory Demonstration / Educational Use
+Setup references: [Raspberry Pi remote access](https://www.raspberrypi.com/documentation/computers/remote-access.html), [Raspberry Pi Connect](https://www.raspberrypi.com/documentation/services/connect.html), [NetworkManager hotspot](https://www.raspberrypi.com/tutorials/host-a-hotel-wifi-hotspot/), [VS Code Remote SSH](https://code.visualstudio.com/docs/remote/ssh).

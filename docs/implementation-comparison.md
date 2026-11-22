@@ -1,3 +1,5 @@
+> Historical design comparison. Some paths and proposed features refer to the earlier layout. Use the main README and docs/verification.md for current operation and evidence limits.
+
 # Implementation Comparison: neew.zip vs files(1).zip
 
 ## Executive Summary

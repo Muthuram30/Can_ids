@@ -1,3 +1,5 @@
+> Historical design comparison. Some paths and proposed features refer to the earlier layout. Use the main README and docs/verification.md for current operation and evidence limits.
+
 # Reference Comparison: Google Drive Material
 
 ## Access Status

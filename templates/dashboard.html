@@ -145,6 +145,7 @@ const base = document.getElementById('joyBase');
 const stick = document.getElementById('joyStick');
 const cmdLabel = document.getElementById('cmdLabel');
 let dragging = false;
+let joyX = 0, joyY = 0;
 let locked = false, wasBlocked = false, failCount = 0;
 
 function applyBlocked(){
@@ -181,6 +182,7 @@ function labelFor(x, y){
 function sendJoystick(x, y){
   // x,y passed to server in [-100,100]; y positive = forward
   if (locked) return;
+  joyX = x; joyY = y;
   cmdLabel.textContent = labelFor(x, -y);
   fetch('/api/joystick', {
     method: 'POST',
@@ -271,14 +273,14 @@ function poll(){
       const blockEl = document.getElementById('idsBlocking');
       const cdWrap = document.getElementById('countdownWrap');
       if (sec.blocking) {
-        blockEl.textContent = 'Blocking in progress (simulated)…';
+        blockEl.textContent = 'Containment countdown…';
         blockEl.className = 'state-warn';
         cdWrap.style.display = 'block';
         document.getElementById('idsCountdown').textContent = sec.seconds_remaining;
         const pct = sec.block_delay > 0 ? (100 * sec.seconds_remaining / sec.block_delay) : 0;
         document.getElementById('countdownFill').style.width = pct + '%';
       } else if (sec.blocked) {
-        blockEl.textContent = 'Attacker blocked (simulated)';
+        blockEl.textContent = 'Controls blocked by gateway';
         blockEl.className = 'state-safe';
         cdWrap.style.display = 'none';
       } else {
@@ -344,6 +346,10 @@ function poll(){
     if (++failCount >= 3 && !wasBlocked) document.getElementById('offlineBar').style.display = 'block';
   });
 }
+// Refresh a held position even without pointer movement. Server stops stale input.
+setInterval(() => { if (dragging && !locked) sendJoystick(joyX, joyY); }, 200);
+window.addEventListener('blur', () => { dragging = false; resetStick(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { dragging = false; resetStick(); } });
 setInterval(poll, 300);
 poll();
 </script>
