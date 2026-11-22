@@ -6,6 +6,12 @@
 # Environment & Secrets
 # ------------------------------------------------------------------------------
 .env
+.pi-sync.json
+.can_ids-sync.json
+.can_ids-runtime-pending
+.can_ids-sync-lock/
+.can_ids-sync.json.tmp
+.can_ids-backups/
 .env.local
 .env.*.local
 *.key

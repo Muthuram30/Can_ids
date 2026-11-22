@@ -2,6 +2,8 @@
 
 The management connection (`HOME_IFACE`, normally wlan0, or Ethernet) is for SSH, Git and Raspberry Pi Connect. The separate lab AP (`AP_IFACE`, normally a USB adapter such as wlan1) is for the configured demo client. NetworkManager owns both in the supported setup.
 
+For local VS Code editing with automatic additions/updates/deletions over SSH, use [run_pi.cmd and the adaptable target-folder workflow](pi-sync.md). The older `~/Can_ids` examples below refer to a Git checkout; substitute your chosen `can_ids` folder for service/runtime commands when using the sync runner.
+
 | Task | Windows / browser | Pi command or location |
 |---|---|---|
 | Open terminal | CMD/PowerShell: `ssh piuser@vehicle-pi.local` | SSH enabled in Imager or `sudo systemctl enable --now ssh` |
@@ -60,7 +62,7 @@ Raspberry Pi Connect can give a browser remote shell without a direct inbound SS
 
 Stop only this lab AP with `sudo .venv/bin/python scripts/setup_wifi.py down`. Restart it with the `ap` command; its profile autoconnects on later boots/device reinsertion. If NetworkManager cannot recover the adapter, inspect `journalctl -u NetworkManager` rather than starting a competing hostapd service.
 
-Before a remote update, the deployment helper creates a `backup/pi-before-update-*` branch. Inspect it with `git branch --list 'backup/*'`. To run a known version without losing current edits, create a separate worktree:
+The direct SSH runner keeps overwritten/deleted source in the chosen folder's `.can_ids-backups/`; see the sync guide for restoration. The separate Git-pull helper `scripts/update.sh` creates a `backup/pi-before-update-*` branch. Inspect those Git backups with `git branch --list 'backup/*'`. In a Git-managed checkout, run a known version without losing current edits by creating a separate worktree:
 
 ```bash
 git worktree add ../Can_ids-previous BACKUP_BRANCH_NAME

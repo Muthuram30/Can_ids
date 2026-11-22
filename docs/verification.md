@@ -4,7 +4,15 @@
 
 The original public head was `711fa37a542bc292c766dbe3a42093cf5a9e6557`, with tree `ac5edf0d9df2efc2274a1aeed13a5ded2daba066`. The retrieved source files and five existing local photos reproduce that tree exactly. The GitHub-signed commit and its original parent history were preserved locally, with branch `backup/before-pi-integration-20261122` and an original-history Git bundle. No existing local CAN project folder was modified.
 
-## Executed checks
+## SSH synchronization runner update
+
+The follow-up adds `run_pi.cmd`, `scripts/sync_pi.py` and a standard-library Pi receiver. It directly mirrors saved source to an adaptable `can_ids` folder without requiring GitHub publication. The PowerShell deployment wrapper now delegates to that runner.
+
+The complete suite now passes **32 tests** (the 21 controller checks below plus 11 synchronization tests). The added tests execute real snapshot packaging, content verification, backups, additions/modifications/deletions, renames, file-to-directory changes and the actual encoded receiver bootstrap in a subprocess with an archive on stdin. They also verify first-time adoption, protected configuration/runtime files, invalid archive/symlink/traversal rejection, and inclusion of uncommitted/new/deleted Git working-tree files. All filesystem mutations occur in disposable test folders.
+
+`run_pi.cmd --help` ran successfully on Windows, and the updated PowerShell wrapper parsed successfully. No actual SSH transfer, Pi dependency install or service restart was possible without a Pi connection. The direct receiver test exercises the transfer payload/receiver without opening a network connection. Watch mode requires SSH keys/agent for later noninteractive transfers; password-only users can run a one-shot sync after each group of edits.
+
+## Original controller checks
 
 | Check | Result |
 |---|---|
@@ -41,7 +49,7 @@ No Pi address/session or connected physical testbed was available. These checks 
 6. Register the exact USB serial, install its generated rule/service, then verify insertion, maintained state, containment and removal/rearm.
 7. Run a deliberate lab-only CAN anomaly with the appropriate model; verify sustained anomaly → motor stop → control refusal → clear/rearm.
 8. Install the user service, enable lingering, reboot, inspect logs and confirm CAN setup and app availability. Bring CAN up via an OS service if automatic CAN configuration is needed.
-9. From a clean local checkout, push a test commit and use `scripts/deploy.ps1`; confirm the Pi ends on that exact SHA and the service health check succeeds.
+9. From the local checkout, run `run_pi.cmd` against the real Pi, then save/add/rename/delete a test source file and verify the matching changes, protected runtime files and backups in the chosen target. Check watch-mode SSH authentication and the running service's post-restart health check.
 
 If install/tests fail during update, the helper stops before restarting the running service; the checkout may already contain the fetched update. Inspect the error and backup branch before retrying. It does not roll dependencies/source back automatically.
 

@@ -4,7 +4,7 @@ A Raspberry Pi gateway controls three ESP32 ECUs over CAN at 500 kbit/s. Its Fla
 
 ![Vehicle prototype with Raspberry Pi, CAN modules and sensors](docs/images/hardware-setup-1.jpeg)
 
-**Start here:** [Connect to the Pi](#1-connect-to-the-pi) · [Install](#2-install-on-the-pi) · [Wi-Fi](#3-configure-wi-fi-from-env) · [CAN](#4-bring-up-can) · [Dashboard](#5-use-the-web-interface) · [Remote development](#6-edit-in-vs-code-and-deploy) · [Troubleshooting](#troubleshooting)
+**Start here:** [Connect to the Pi](#1-connect-to-the-pi) · [Install](#2-install-on-the-pi) · [Wi-Fi](#3-configure-wi-fi-from-env) · [CAN](#4-bring-up-can) · [Dashboard](#5-use-the-web-interface) · [VS Code → Pi runner](#6-edit-locally-in-vs-code-and-sync-directly-to-the-pi) · [Troubleshooting](#troubleshooting)
 
 ## What the current code implements
 
@@ -177,51 +177,62 @@ The trainer creates a **synthetic baseline** model at `can_ids_model.joblib` (ig
 
 The optional USB demonstration needs explicit registration and installation: [USB guide](docs/usb-demo.md). It executes a fixed repository script, never files from the inserted drive.
 
-## 6. Edit in VS Code and deploy
+## 6. Edit locally in VS Code and sync directly to the Pi
 
-### Recommended: edit directly on the Pi using Remote SSH
-
-Install VS Code's **Remote - SSH** extension on Windows. Choose **Remote-SSH: Connect to Host…**, enter `piuser@vehicle-pi.local`, then open `/home/piuser/Can_ids`. Select `.venv/bin/python` in the remote Python extension. Every saved edit is already on the Pi; no ZIP or copy step is required. VS Code's integrated terminal is now a **Pi shell**.
-
-```bash
-cd ~/Can_ids
-.venv/bin/python -m unittest discover -s tests -v
-git status --short
-git add -A
-git diff --cached
-git commit -m "Describe the CAN IDS change"
-git push origin main
-systemctl --user restart vehicle-ids.service
-```
-
-Run the restart only if you installed the service below; otherwise stop and restart `scripts/runner.sh`. A save does not automatically restart the hardware controller. `.env`, models, logs and runtime files are ignored. Review the staged diff before committing. GitHub HTTPS pushes require authentication (a token/credential manager), or use a GitHub SSH key; do not put tokens into `.env` or the remote URL.
-
-### Alternative: edit locally on Windows, push, then update the Pi
-
-Commit and push from your local VS Code checkout, then run **in PowerShell**:
+Open this checkout in VS Code. In its Windows integrated terminal run:
 
 ```powershell
-git push origin main
-.\scripts\deploy.ps1 -PiHost piuser@vehicle-pi.local
+.\run_pi.cmd
 ```
 
-This requires the Pi checkout at `~/Can_ids`. The helper checks that the local commit equals `origin/main`, connects over SSH, checks that the Pi has a clean `main` checkout, makes a backup branch, fast-forwards to that exact commit, installs requirements, runs tests and restarts a running user service. It stops on divergence or failure; it never resets/discards Pi edits. PowerShell may require `powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1 -PiHost piuser@vehicle-pi.local` for that invocation.
+The first run asks for your SSH login and destination, for example `muthu@vehicle-pi.local` and `~/can_ids`. It remembers them locally, so the same command works afterwards. Or supply them explicitly:
 
-From PuTTY or Connect shell, the equivalent is:
-
-```bash
-cd ~/Can_ids
-bash scripts/update.sh
+```powershell
+.\run_pi.cmd --host muthu@vehicle-pi.local --target /home/muthu/can_ids
 ```
 
-Use one editing workflow at a time to avoid conflicts. A commit alone does not deploy a local Windows file; either edit the remote checkout or push and run the deployment helper.
+Use `~/can_ids`, `/home/can_ids`, `/home/muthu/can_ids`, `/muthu/can_ids` or another writable absolute path ending in `can_ids`. The app, virtual environment, local configuration, sync manifest and backups all live under that chosen project folder. Scripts discover their own location; there is no required Pi username. If you choose `/home/can_ids`, its parent permissions may require the one-time ownership setup described in the [sync guide](docs/pi-sync.md).
+
+The runner transfers saved local files over SSH without requiring a GitHub commit/push, rsync, WSL or a Python package on Windows. It adds new source files, replaces edited files, deletes previously synchronized files that you deleted locally, and handles renames as removal plus addition. Before replacing/removing existing source it keeps a timestamped copy inside the Pi folder. `.env`, `.venv`, models, captured data, runtime state, logs, Git metadata and saved connection settings are protected.
+
+To update automatically as you save/add/delete files in VS Code:
+
+```powershell
+.\run_pi.cmd --watch
+```
+
+Press Ctrl+C to stop. Watch mode uses SSH key/agent authentication for subsequent transfers; see the guide for setup. Unsaved editor text is not transferred. Git-ignored files are omitted, including generated build outputs.
+
+If the chosen Pi folder already contains an older project and has no sync manifest, explicitly adopt it once:
+
+```powershell
+.\run_pi.cmd --adopt
+```
+
+This backs up and removes obsolete non-runtime source files in that **chosen folder** to match the local snapshot. Later runs automatically reconcile the recorded source files. Files created independently on the Pi after adoption are left alone unless they conflict with a source path. Use the Windows checkout as the source of truth for synchronized files.
+
+By default, the runner creates the Pi virtual environment if absent, installs dependencies initially/when requirements change, runs tests, and restarts an already running `vehicle-ids.service` after successful checks. It regenerates the service unit with your chosen folder before restarting. The first run creates `.env` from the example only if it does not already exist: edit real Wi-Fi/client settings there once. It does not flash ESP32 boards or configure Wi-Fi/CAN implicitly.
+
+Useful variants:
+
+```powershell
+.\run_pi.cmd --setup
+.\run_pi.cmd --code-only
+.\run_pi.cmd --no-restart
+```
+
+`--setup` changes the saved connection; `--code-only` skips dependency/test/service steps; `--no-restart` runs setup/checks while leaving the current service running. The optional PowerShell wrapper supports the same workflow: `.\scripts\deploy.ps1 -PiHost muthu@vehicle-pi.local -Target ~/can_ids -Watch`.
+
+For initial service installation, open SSH/PuTTY/Connect, change to your chosen folder, then run section 7 below. Existing instructions using `~/Can_ids` refer to a normal Git clone; replace that directory with your chosen sync destination. See [all sync options, recovery and GitHub push steps](docs/pi-sync.md).
+
+**GitHub publication is separate:** after reviewing and committing local changes, `git push origin main` publishes them. The sync runner never commits, pushes, or requires a clean Git working tree. `scripts/update.sh` remains an optional Git-pull workflow for a separate Git-managed Pi checkout; use one deployment method per folder.
 
 ## 7. Run automatically after boot
 
 Stop any foreground app first; two instances would compete for port 5000 and send duplicate CAN traffic.
 
 ```bash
-cd ~/Can_ids
+cd ~/can_ids  # or your chosen target folder
 bash scripts/install_service.sh
 sudo loginctl enable-linger "$USER"
 systemctl --user status vehicle-ids.service
