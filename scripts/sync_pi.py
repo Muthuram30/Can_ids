@@ -202,22 +202,29 @@ def main():
     files = sync_once(config, args)
     if not args.watch:
         return
+    watch(config, args, files)
+
+
+def watch(config, args, files):
     print("Watching saved files. Ctrl+C stops watching; later transfers require SSH key/agent login.", flush=True)
     previous = fingerprint(files)
     while True:
         time.sleep(1)
-        files = source_files(ROOT)
-        current = fingerprint(files)
-        if current == previous:
-            continue
-        # Wait for a quiet interval so editor multi-file saves travel in one snapshot.
-        time.sleep(.5)
-        files = source_files(ROOT)
         try:
+            if fingerprint(source_files(ROOT)) == previous:
+                continue
+            time.sleep(.5)
             files = sync_once(config, args, batch=True)
         except subprocess.CalledProcessError:
+            # A failed transfer may already have changed remote files. Retry even
+            # if the editor has since reverted to the last acknowledged snapshot.
+            previous = None
             print("Sync failed. Source remains local; retrying in five seconds. Check SSH key/agent and Pi logs.", file=sys.stderr)
             time.sleep(5)
+            continue
+        except FileNotFoundError:
+            # An editor may replace or remove a file during enumeration.
+            previous = None
             continue
         previous = fingerprint(files)
 
@@ -227,5 +234,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nPi sync stopped.")
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"Pi sync failed: {error.cmd[0]} exited with status {error.returncode}. See the error above.")
+    except (ValueError, OSError) as error:
         raise SystemExit("Pi sync failed: " + str(error))

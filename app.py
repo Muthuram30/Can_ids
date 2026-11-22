@@ -111,18 +111,28 @@ def load_ml_model():
     if ml_bundle is not None or joblib is None:
         return
     try:
-        candidate = joblib.load(ML_MODEL_PATH)
+        # A partially written or incompatible joblib file can raise decoder-
+        # specific exceptions. Keep the rule-based monitor running on load errors.
+        try:
+            candidate = joblib.load(ML_MODEL_PATH)
+        except Exception as error:
+            raise ValueError(f"model read failed: {type(error).__name__}: {error}") from error
         if (not isinstance(candidate, dict)
                 or not {"scaler", "model", "feature_names", "window_seconds"} <= candidate.keys()
                 or list(candidate["feature_names"]) != FEATURE_NAMES
-                or candidate["window_seconds"] != ML_WINDOW_SECONDS):
+                or candidate["window_seconds"] != ML_WINDOW_SECONDS
+                or not callable(getattr(candidate["scaler"], "transform", None))
+                or not all(callable(getattr(candidate["model"], name, None))
+                           for name in ("decision_function", "predict"))):
             raise ValueError("incompatible live model bundle; use the root trainer")
         ml_bundle = candidate
         ml_load_error = None
         log.info("ML: loaded %s (trained on %d features)", ML_MODEL_PATH, len(ml_bundle["feature_names"]))
-    except (OSError, ValueError, KeyError) as e:
-        ml_load_error = f"could not load {ML_MODEL_PATH} ({e}) -- run train_can_ids_model.py"
-        log.warning("ML: %s", ml_load_error)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        message = f"could not load {ML_MODEL_PATH} ({e}) -- run train_can_ids_model.py"
+        if message != ml_load_error:
+            log.warning("ML: %s", message)
+        ml_load_error = message
 
 
 can_window_lock = threading.Lock()

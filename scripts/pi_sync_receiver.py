@@ -16,21 +16,22 @@ MANIFEST = ".can_ids-sync.json"
 PACKAGE = ".can_ids-package.json"
 RESERVED = {MANIFEST, MANIFEST + ".tmp", PACKAGE, ".can_ids-backups", ".pi-sync.json",
             ".can_ids-runtime-pending", ".can_ids-sync-lock", "credentials.json", "secrets.json"}
-RUNTIME_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "logs", "run",
+RUNTIME_DIRS = {".git", ".ssh", ".venv", "venv", "__pycache__", ".pytest_cache", "logs", "run",
                 "node_modules", ".vscode", ".idea", "training_results", "checkpoints"}
 
 
 def source_path(name):
     """Accept only project source paths; reject secrets, state and traversal."""
-    parts = PurePosixPath(name).parts
+    parts = PurePosixPath(name.casefold()).parts
     if (not name or "\\" in name or ":" in name or name.startswith("/")
             or any(p in ("", ".", "..") for p in name.split("/"))
             or any(p in RUNTIME_DIRS or p in RESERVED for p in parts)):
         return False
     filename = parts[-1]
     return (not (filename.startswith(".env") and filename != ".env.example")
+            and filename not in {"id_rsa", "id_dsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk"}
             and not filename.endswith((".pyc", ".log", ".joblib", ".pkl", ".pickle", ".pem", ".key"))
-            and not (parts[0] == "data" and filename != "README.md"))
+            and not (parts[0] == "data" and filename != "readme.md"))
 
 
 def target_folder(value):
@@ -206,7 +207,7 @@ def commit_source(root, paths, message):
         raise ValueError("Use an independent project checkout, not a symlink/worktree Git directory")
     if not (root / ".git").exists():
         subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
-    prefix = ["git", "-C", str(root)]
+    prefix = ["git", "--literal-pathspecs", "-C", str(root)]
     staged = subprocess.check_output(prefix + ["diff", "--cached", "--name-only", "-z"])
     if any(not source_path(p.decode()) for p in staged.split(b"\0") if p):
         raise ValueError("Protected/runtime files are already staged; unstage them before committing")

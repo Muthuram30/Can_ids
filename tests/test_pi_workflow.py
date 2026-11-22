@@ -87,6 +87,45 @@ class PiWorkflowTests(unittest.TestCase):
             commit.assert_not_called()
         self.assertFalse((self.local / ".git").exists())
 
+    def test_watch_retries_after_lost_acknowledgment_and_editor_revert(self):
+        original = {"app.py": b"original"}
+        modified = {"app.py": b"edited"}
+        with patch.object(sync, "source_files", side_effect=[modified, original, KeyboardInterrupt]), \
+             patch.object(sync.time, "sleep"), \
+             patch.object(sync, "sync_once", side_effect=[
+                 subprocess.CalledProcessError(255, ["ssh"]), original]) as send:
+            with self.assertRaises(KeyboardInterrupt):
+                sync.watch(self.config, object(), original)
+        self.assertEqual(send.call_count, 2)
+
+    def test_runtime_failure_retries_before_pi_checkpoint(self):
+        files = {"app.py": b"source", "can_features.py": b"features"}
+        def receive():
+            with sync.snapshot(files) as archive, \
+                 patch.object(sys, "stdin", argparse.Namespace(buffer=archive)), \
+                 patch.object(sys, "argv", ["receiver", str(self.pi)]):
+                receiver.main()
+
+        with patch.object(receiver, "runtime_update", side_effect=[
+                subprocess.CalledProcessError(1, ["pip"]), None]) as runtime:
+            with self.assertRaises(subprocess.CalledProcessError):
+                receive()
+            self.assertFalse((self.pi / ".git").exists())
+            self.assertFalse((self.pi / ".can_ids-sync-lock").exists())
+            self.assertTrue((self.pi / ".can_ids-runtime-pending").exists())
+            receive()
+            self.assertEqual(runtime.call_args.args[1:3], ([], True))
+        self.assertFalse((self.pi / ".can_ids-runtime-pending").exists())
+        self.assertTrue((self.pi / ".git").is_dir())
+
+    def test_checkpoint_uses_literal_git_paths(self):
+        self.pi.mkdir()
+        for name in ("[a].py", "a.py"):
+            (self.pi / name).write_text(name)
+        receiver.commit_source(self.pi, ["[a].py"], "One source file")
+        tracked = subprocess.check_output(["git", "-C", str(self.pi), "ls-files"]).splitlines()
+        self.assertEqual(tracked, [b"[a].py"])
+
     def test_git_commits_adopted_deletions_and_file_directory_changes(self):
         self.pi.mkdir()
         (self.pi / "old.py").write_text("old")

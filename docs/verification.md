@@ -4,13 +4,22 @@
 
 The original public head was `711fa37a542bc292c766dbe3a42093cf5a9e6557`, with tree `ac5edf0d9df2efc2274a1aeed13a5ded2daba066`. The retrieved source files and five existing local photos reproduce that tree exactly. The GitHub-signed commit and its original parent history were preserved locally, with branch `backup/before-pi-integration-20261122` and an original-history Git bundle. No existing local CAN project folder was modified.
 
-## SSH synchronization runner update
+## Offline deployment rehearsal
 
-The follow-up adds `run_pi.cmd`, `scripts/sync_pi.py` and a standard-library Pi receiver. It directly mirrors saved source to an adaptable `can_ids` folder without requiring GitHub publication. The PowerShell deployment wrapper now delegates to that runner.
+The Windows suite passed 43 tests using Python 3.11.9. It covers 22 controller/configuration checks, 11 snapshot checks and 10 setup, Git and launcher checks.
 
-The complete suite now contains **39 tests** (21 controller checks, 11 snapshot/synchronization checks and 7 setup/commit/control workflow checks). The added tests execute real snapshot packaging, content verification, backups, additions/modifications/deletions, renames, file-to-directory changes and the actual encoded receiver bootstrap in a subprocess with an archive on stdin. They also verify first-time adoption, protected configuration/runtime files, invalid archive/symlink/traversal rejection, and inclusion of uncommitted/new/deleted Git working-tree files. All filesystem mutations occur in disposable test folders.
+| Exercise | Observed result |
+|---|---|
+| First launch from a source copy without Git history | The actual `run_pi.cmd` accepted the interactive setup, created the chosen `~/lab space/can_ids` folder on the stand-in and committed both sides. A second run created zero extra commits. |
+| Add, edit, then delete a file | The mirrored contents matched after each update. The receiver saved the deleted file under its backup directory. Separate suite cases covered renames and file-to-directory changes. |
+| Interrupt dependency installation | An intentionally missing local wheel made pip fail. The Pi checkpoint stayed at its previous commit and the pending marker remained. A retry using a fixture requirements file and the preinstalled test dependencies completed the suite and cleared the marker. |
+| Separate launcher | `run.cmd test` executed the suite from the mirrored project. The terminal action selected the expected directory. The test transport recorded the Bash request. |
+| Private configuration | The laptop and simulated Pi each had a disposable Wi-Fi password. The mirror preserved the Pi configuration. The captured runner output and Pi Git index excluded the credential. |
+| Model unavailable at startup | The standalone controller opened a virtual CAN bus. Tests verified that a truncated model leaves rule detection available, repeated load failures generate one warning for the same error, and replacing the file with a valid model enables ML. |
 
-`run_pi.cmd --help` and `run.cmd --help` ran successfully on Windows, and the PowerShell wrapper parsed successfully. The new workflow checks use real local and simulated-Pi folders with real Git commits and actual receiver subprocesses: prerequisite/folder preflight precedes laptop commits; a failed preflight prevents commits; multiple add/edit/rename/delete transfers create both histories and retain secrets/backups. They also check staged-secret rejection and app/terminal dispatch, including avoiding a second controller over a running service. The simulated transport replaces SSH network calls only; its Pi prerequisite apt/sudo branch and real service processes are not executed. No actual SSH transfer, Pi dependency install or service restart was possible without a Pi connection. The direct receiver test exercises the transfer payload/receiver without opening a network connection. Watch mode requires SSH keys/agent for later noninteractive transfers; password-only users can run a one-shot sync after each group of edits.
+The rehearsal used two temporary folders and a local executable standing in for SSH. Git, the Windows launchers, archive transfer through stdin, the receiver, pip failure handling and both test-suite invocations ran as processes. The Windows stand-in used an existing Python environment. Authentication, an interactive remote shell, apt, a fresh installation of the production requirements and systemd still need a Pi. The rehearsal removed its temporary folders after the run.
+
+Regression tests also exercise a watch-mode retry after a lost acknowledgment and an editor revert, literal filenames containing Git pattern characters, and credential filenames with mixed capitalization. For device setup and watch-mode authentication, see [Pi synchronization](pi-sync.md).
 
 ## Original controller checks
 

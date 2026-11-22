@@ -80,7 +80,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((self.root / "node/private.txt").read_text(), "Pi only")
 
     def test_protected_and_traversal_archive_paths_rejected(self):
-        for name in ("../outside", "/home/can_ids/app.py", ".env", ".git/config", "run/usb.json", "credentials.json"):
+        for name in ("../outside", "/home/can_ids/app.py", ".env", ".ENV", "Secrets.JSON",
+                     "lab/DEVICE.KEY", ".ssh/config", "id_ed25519", ".git/config", "run/usb.json", "credentials.json"):
             with self.subTest(name=name):
                 with sender.snapshot(project(**{name: b"bad"})) as bundle:
                     with self.assertRaises(ValueError):

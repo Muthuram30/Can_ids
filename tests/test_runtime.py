@@ -19,7 +19,14 @@ import joblib
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-import app as gateway
+from dotenv import dotenv_values
+
+# A Pi runs this suite after creating its private .env. Keep its settings,
+# hardware paths and credentials out of the controller fixtures and test output.
+with patch.dict(os.environ), patch("dotenv.load_dotenv"):
+    for key in dotenv_values(Path(__file__).resolve().parents[1] / ".env.example"):
+        os.environ.pop(key, None)
+    import app as gateway
 from can_features import FEATURE_NAMES, extract_features
 from scripts.setup_wifi import configure, settings
 from scripts.install_usb import render
@@ -191,6 +198,24 @@ class GatewayTests(unittest.TestCase):
                 self.assertIsInstance(score, float)
                 self.assertIsInstance(anomaly, bool)
 
+    def test_incomplete_model_warns_once_and_recovers_after_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.joblib"
+            path.touch()
+            with patch.object(gateway, "ML_MODEL_PATH", str(path)), \
+                 patch.object(gateway, "ml_bundle", None), patch.object(gateway, "ml_load_error", None):
+                with self.assertLogs(gateway.log, "WARNING") as warned:
+                    for _ in range(2):
+                        self.assertEqual(self.client.post("/api/ml/toggle", json={"enabled": True}).status_code, 503)
+                self.assertEqual(len(warned.records), 1)
+                self.assertFalse(self.client.get("/api/state").get_json()["security"]["ml"]["enabled"])
+                features = np.zeros((4, len(FEATURE_NAMES)))
+                joblib.dump(dict(scaler=StandardScaler().fit(features),
+                                 model=IsolationForest(n_estimators=2, random_state=7).fit(features),
+                                 feature_names=FEATURE_NAMES, window_seconds=2.0), path)
+                self.assertEqual(self.client.post("/api/ml/toggle", json={"enabled": True}).status_code, 200)
+                self.assertIsNone(gateway.ml_load_error)
+
     def test_ml_toggle_requires_a_boolean(self):
         for body in ([], {"enabled": "false"}, {"enabled": 1}):
             self.assertEqual(self.client.post("/api/ml/toggle", json=body).status_code, 400)
@@ -205,11 +230,13 @@ class ConfigurationTests(unittest.TestCase):
                 (root / name).write_bytes((Path(gateway.__file__).parent / name).read_bytes())
             (root / ".env").write_text('APP_PORT=5088\nCAN_CHANNEL=virtual-test\nHOME_PASSWORD="space # secret"\nUSB_STATE_FILE=run/test.json\n')
             env = dict(os.environ, APP_PORT="5099")
-            result = subprocess.run([sys.executable, "-c", "import importlib.util,sys,json,os; s=importlib.util.spec_from_file_location('isolated_gateway',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps([os.getenv('APP_PORT'),m.CAN_CHANNEL,os.getenv('HOME_PASSWORD'),m.USB_STATE_FILE]))", str(root / "app.py")],
+            for key in ("CAN_CHANNEL", "HOME_PASSWORD", "USB_STATE_FILE"):
+                env.pop(key, None)
+            result = subprocess.run([sys.executable, "-c", "import importlib.util,sys,json,os; s=importlib.util.spec_from_file_location('isolated_gateway',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps([os.getenv('APP_PORT'),m.CAN_CHANNEL,os.getenv('HOME_PASSWORD') == 'space # secret',m.USB_STATE_FILE]))", str(root / "app.py")],
                                     cwd=root.parent, env=dict(env, PYTHONPATH=str(root) + os.pathsep + env.get("PYTHONPATH", "")),
                                     capture_output=True, text=True, check=True)
-            port, channel, password, state_path = json.loads(result.stdout.strip())
-            self.assertEqual((port, channel, password), ("5099", "virtual-test", "space # secret"))
+            port, channel, password_matches, state_path = json.loads(result.stdout.strip())
+            self.assertEqual((port, channel, password_matches), ("5099", "virtual-test", True))
             self.assertEqual(Path(state_path), root / "run/test.json")
 
     def test_wifi_rejects_management_adapter_and_bad_password(self):
