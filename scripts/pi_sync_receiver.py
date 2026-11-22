@@ -47,6 +47,23 @@ def target_folder(value):
     return root
 
 
+def prepare_target(value, adopt=False):
+    root = target_folder(value)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        if root.exists():
+            raise ValueError("Choose a project folder owned by your SSH user")
+        # Only the validated new project folder is created/owned with sudo.
+        subprocess.run(["sudo", "install", "-d", "-o", str(os.getuid()),
+                        "-g", str(os.getgid()), str(root)], check=True)
+    if not os.access(root, os.W_OK | os.X_OK):
+        raise ValueError("Project folder is not writable by the SSH user")
+    managed_before(root, adopt)
+    print("Pi folder ready: " + str(root), flush=True)
+    return root
+
+
 def inside(root, relative):
     if not source_path(relative):
         raise ValueError("Protected or invalid source path: " + relative)
@@ -183,6 +200,38 @@ def apply_snapshot(root, files, hashes, adopt=False):
     return changed, deleted
 
 
+def commit_source(root, paths, message):
+    """Checkpoint only explicitly selected source paths, never credentials/runtime."""
+    if (root / ".git").is_symlink() or (root / ".git").is_file():
+        raise ValueError("Use an independent project checkout, not a symlink/worktree Git directory")
+    if not (root / ".git").exists():
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    prefix = ["git", "-C", str(root)]
+    staged = subprocess.check_output(prefix + ["diff", "--cached", "--name-only", "-z"])
+    if any(not source_path(p.decode()) for p in staged.split(b"\0") if p):
+        raise ValueError("Protected/runtime files are already staged; unstage them before committing")
+    selected = sorted(set(p for p in paths if source_path(p)))
+    tracked = {p.decode() for p in subprocess.check_output(prefix + ["ls-files", "-z"]).split(b"\0") if p}
+    removed = [p for p in selected if p in tracked and not (root / p).is_file()]
+    if removed:
+        subprocess.run(prefix + ["update-index", "--force-remove", "-z", "--stdin"],
+                       input=b"\0".join(p.encode() for p in removed) + b"\0", check=True)
+    selected = [p for p in selected if (root / p).is_file()]
+    if selected:
+        subprocess.run(prefix + ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                       input=b"\0".join(p.encode() for p in selected) + b"\0", check=True)
+    difference = subprocess.run(prefix + ["diff", "--cached", "--quiet"])
+    if difference.returncode not in (0, 1):
+        raise RuntimeError("Could not inspect Git source changes")
+    if difference.returncode:
+        identity = []
+        for field, fallback in (("user.name", "CAN IDS Sync"), ("user.email", "can-ids-sync@localhost")):
+            if subprocess.run(prefix + ["config", "--get", field], stdout=subprocess.DEVNULL).returncode:
+                identity += ["-c", field + "=" + fallback]
+        subprocess.run(prefix + identity + ["commit", "-q", "-m", message], check=True)
+    return subprocess.check_output(prefix + ["rev-parse", "HEAD"]).decode().strip()
+
+
 def runtime_update(root, changed, initial, restart):
     python = root / ".venv/bin/python"
     if not python.exists():
@@ -216,6 +265,9 @@ def main():
     parser.add_argument("--adopt", action="store_true")
     parser.add_argument("--code-only", action="store_true")
     parser.add_argument("--no-restart", action="store_true")
+    parser.add_argument("--no-commit", action="store_true")
+    parser.add_argument("--message", default="Update CAN IDS source from laptop")
+    parser.add_argument("--source-commit", default="")
     args = parser.parse_args()
     root = target_folder(args.target)
     initial = not (root / MANIFEST).exists()
@@ -238,6 +290,18 @@ def main():
         if not args.code_only:
             runtime_update(root, changed, initial or retry, not args.no_restart)
             pending.unlink()
+        if not args.no_commit:
+            tracked = []
+            if (root / ".git").exists():
+                tracked = [p.decode() for p in subprocess.check_output(
+                    ["git", "-C", str(root), "ls-files", "-z"]).split(b"\0") if p]
+            message = args.message
+            if args.source_commit:
+                message += "\n\nLaptop source commit: " + args.source_commit
+            # Include formerly tracked source so a failed previous run's deletions
+            # are checkpointed too; protected paths remain excluded.
+            commit = commit_source(root, [*files, *deleted, *tracked], message)
+            print("Pi source checkpoint: " + commit[:12], flush=True)
     finally:
         lock.rmdir()
 

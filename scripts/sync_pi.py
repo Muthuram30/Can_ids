@@ -7,6 +7,7 @@ import io
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -16,9 +17,9 @@ from pathlib import Path
 
 # Running as a script places scripts/ on sys.path; unittest imports as a package.
 try:
-    from .pi_sync_receiver import PACKAGE, source_path
+    from .pi_sync_receiver import PACKAGE, source_path, commit_source
 except ImportError:
-    from pi_sync_receiver import PACKAGE, source_path
+    from pi_sync_receiver import PACKAGE, source_path, commit_source
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / ".pi-sync.json"
@@ -97,6 +98,54 @@ def snapshot(files):
     return archive
 
 
+def ssh_base(config, batch=False, terminal=False):
+    command = ["ssh", "-p", str(config["port"]), "-o", "ConnectTimeout=10",
+               "-o", "ServerAliveInterval=15"]
+    if terminal:
+        command.append("-t")
+    if batch:
+        command += ["-o", "BatchMode=yes"]
+    if config.get("identity"):
+        command += ["-i", config["identity"]]
+    return command + [config["host"]]
+
+
+def preflight_command(config, adopt=False):
+    # The first SSH session has a terminal, so sudo can ask for the Pi password.
+    # The archive is transferred in a separate session only after setup succeeds.
+    source = (ROOT / "scripts/pi_sync_receiver.py").read_bytes()
+    encoded = base64.b64encode(source).decode()
+    check = ("import base64,os,subprocess,sys; n={'__name__':'preflight'}; "
+             "exec(compile(base64.b64decode('" + encoded + "'),'<preflight>','exec'),n); "
+             "n['prepare_target'](sys.argv[1],sys.argv[2]=='1')")
+    script = '''set -eu
+if ! command -v python3 >/dev/null || ! command -v git >/dev/null || ! command -v ssh >/dev/null || ! command -v nano >/dev/null || ! python3 -c 'import ensurepip,venv,sys; assert sys.version_info >= (3,9)' >/dev/null 2>&1; then
+  command -v apt-get >/dev/null || { echo 'Install Python 3, python3-venv and Git on this Pi first.' >&2; exit 1; }
+  sudo apt-get update
+  sudo apt-get install -y python3 python3-venv python3-pip git openssh-client nano
+fi
+'''
+    script += shlex.join(["python3", "-c", check, config["target"], "1" if adopt else "0"])
+    return ssh_base(config, terminal=True) + [shlex.join(["sh", "-c", script])]
+
+
+def prepare(config, adopt=False):
+    for name in ("ssh", "git"):
+        if not shutil.which(name):
+            raise ValueError("Install " + name + " on the laptop and add it to PATH")
+    print("Checking SSH, Pi prerequisites and destination before making source commits...", flush=True)
+    subprocess.run(preflight_command(config, adopt), check=True)
+    print("Laptop and Pi connection ready.", flush=True)
+
+
+def checkpoint(root, message):
+    if not (root / ".git").exists():
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    paths = subprocess.check_output(["git", "-C", str(root), "ls-files", "--cached", "--others",
+                                     "--exclude-standard", "-z"])
+    return commit_source(root, [p.decode() for p in paths.split(b"\0") if p], message)
+
+
 def ssh_command(config, args, batch=False):
     receiver = (ROOT / "scripts/pi_sync_receiver.py").read_bytes()
     encoded = base64.b64encode(receiver).decode("ascii")
@@ -108,20 +157,30 @@ def ssh_command(config, args, batch=False):
         remote.append("--code-only")
     if args.no_restart:
         remote.append("--no-restart")
-    command = ["ssh", "-p", str(config["port"]), "-o", "ConnectTimeout=10",
-               "-o", "ServerAliveInterval=15"]
-    if batch:
-        command += ["-o", "BatchMode=yes"]
-    if config.get("identity"):
-        command += ["-i", config["identity"]]
-    command += [config["host"], shlex.join(remote)]
-    return command
+    if getattr(args, "no_commit", False):
+        remote.append("--no-commit")
+    if getattr(args, "source_commit", ""):
+        remote += ["--source-commit", args.source_commit]
+    if getattr(args, "message", ""):
+        remote += ["--message", args.message]
+    return ssh_base(config, batch=batch) + [shlex.join(remote)]
 
 
 def send(config, args, files, batch=False):
     print("Synchronizing saved source to " + config["host"] + ":" + config["target"], flush=True)
     with snapshot(files) as archive:
         subprocess.run(ssh_command(config, args, batch), stdin=archive, check=True)
+
+
+def sync_once(config, args, batch=False):
+    if not args.no_commit:
+        args.source_commit = checkpoint(ROOT, args.message)
+        print("Laptop source checkpoint: " + args.source_commit[:12], flush=True)
+    elif not (ROOT / ".git").exists():
+        subprocess.run(["git", "init", "-q", "-b", "main", str(ROOT)], check=True)
+    files = source_files(ROOT)
+    send(config, args, files, batch)
+    return files
 
 
 def main():
@@ -135,10 +194,12 @@ def main():
     parser.add_argument("--adopt", action="store_true", help="first sync: back up/remove obsolete non-runtime files already in the chosen folder")
     parser.add_argument("--code-only", action="store_true", help="sync source without pip, tests or service actions")
     parser.add_argument("--no-restart", action="store_true", help="update/test without restarting a running user service")
+    parser.add_argument("--no-commit", action="store_true", help="mirror source without laptop/Pi Git checkpoints")
+    parser.add_argument("--message", default="Update CAN IDS source from laptop", help="Git checkpoint message")
     args = parser.parse_args()
     config = configuration(args)
-    files = source_files(ROOT)
-    send(config, args, files)
+    prepare(config, args.adopt)
+    files = sync_once(config, args)
     if not args.watch:
         return
     print("Watching saved files. Ctrl+C stops watching; later transfers require SSH key/agent login.", flush=True)
@@ -153,7 +214,7 @@ def main():
         time.sleep(.5)
         files = source_files(ROOT)
         try:
-            send(config, args, files, batch=True)
+            files = sync_once(config, args, batch=True)
         except subprocess.CalledProcessError:
             print("Sync failed. Source remains local; retrying in five seconds. Check SSH key/agent and Pi logs.", file=sys.stderr)
             time.sleep(5)

@@ -179,13 +179,23 @@ The optional USB demonstration needs explicit registration and installation: [US
 
 ## 6. Edit locally in VS Code and sync directly to the Pi
 
+Two Windows runners handle the lab workflow:
+
+| Runner | Purpose |
+|---|---|
+| `run_pi.cmd` | First-time connection/folder setup, then source commits and synchronization |
+| `run.cmd` | Menu for running the app, opening a Pi terminal, tests, configuration and service control |
+
+On first use, `run_pi.cmd` asks for the SSH login and target, checks the laptop's tools, connects to the Pi with a terminal, installs missing Python/venv/Git/SSH-client/editor prerequisites via apt/sudo when necessary, and creates/verifies the chosen folder **before making source commits**. Your SSH user may need to enter a sudo password during setup. Later runs reuse the saved settings. Use a reachable Pi hostname/IP over Wi-Fi, Ethernet, hotspot or VPN; VS Code, CMD, PowerShell and PuTTY can all use that SSH connection. Raspberry Pi Connect remote shell alone does not create a network route for Windows SSH.
+
+
 Open this checkout in VS Code. In its Windows integrated terminal run:
 
 ```powershell
 .\run_pi.cmd
 ```
 
-The first run asks for your SSH login and destination, for example `muthu@vehicle-pi.local` and `~/can_ids`. It remembers them locally, so the same command works afterwards. Or supply them explicitly:
+The first run asks for your SSH login and destination, for example `muthu@vehicle-pi.local` and `~/can_ids`. It remembers them locally, so the same command works afterwards. A Git clone or downloaded/extracted repository ZIP works: if needed, the runner initializes local Git after the Pi setup check. Or supply them explicitly:
 
 ```powershell
 .\run_pi.cmd --host muthu@vehicle-pi.local --target /home/muthu/can_ids
@@ -211,7 +221,7 @@ If the chosen Pi folder already contains an older project and has no sync manife
 
 This backs up and removes obsolete non-runtime source files in that **chosen folder** to match the local snapshot. Later runs automatically reconcile the recorded source files. Files created independently on the Pi after adoption are left alone unless they conflict with a source path. Use the Windows checkout as the source of truth for synchronized files.
 
-By default, the runner creates the Pi virtual environment if absent, installs dependencies initially/when requirements change, runs tests, and restarts an already running `vehicle-ids.service` after successful checks. It regenerates the service unit with your chosen folder before restarting. The first run creates `.env` from the example only if it does not already exist: edit real Wi-Fi/client settings there once. It does not flash ESP32 boards or configure Wi-Fi/CAN implicitly.
+By default, the runner commits changed source locally, sends it to the Pi, creates the Pi virtual environment if absent, installs dependencies initially/when requirements change, runs tests, and restarts an already running `vehicle-ids.service` after successful checks. It regenerates the service unit with your chosen folder before restarting. After successful preparation/checks it also creates a source checkpoint in the Pi folder, recording the laptop commit. No-change runs reuse the existing commit. Secrets and runtime files are excluded from both histories. The first run creates `.env` from the example only if it does not already exist: edit real Wi-Fi/client settings there once. It does not flash ESP32 boards or configure Wi-Fi/CAN implicitly.
 
 Useful variants:
 
@@ -221,11 +231,25 @@ Useful variants:
 .\run_pi.cmd --no-restart
 ```
 
-`--setup` changes the saved connection; `--code-only` skips dependency/test/service steps; `--no-restart` runs setup/checks while leaving the current service running. The optional PowerShell wrapper supports the same workflow: `.\scripts\deploy.ps1 -PiHost muthu@vehicle-pi.local -Target ~/can_ids -Watch`.
+`--setup` changes the saved connection; `--no-commit` disables source checkpoints; `--message "Lab update"` supplies their message; `--code-only` skips dependency/test/service steps; `--no-restart` runs setup/checks while leaving the current service running. The optional PowerShell wrapper supports the same workflow: `.\scripts\deploy.ps1 -PiHost muthu@vehicle-pi.local -Target ~/can_ids -Watch`.
 
-For initial service installation, open SSH/PuTTY/Connect, change to your chosen folder, then run section 7 below. Existing instructions using `~/Can_ids` refer to a normal Git clone; replace that directory with your chosen sync destination. See [all sync options, recovery and GitHub push steps](docs/pi-sync.md).
+Run app/terminal commands from the laptop using the same remembered connection:
 
-**GitHub publication is separate:** after reviewing and committing local changes, `git push origin main` publishes them. The sync runner never commits, pushes, or requires a clean Git working tree. `scripts/update.sh` remains an optional Git-pull workflow for a separate Git-managed Pi checkout; use one deployment method per folder.
+```powershell
+.\run.cmd
+.\run.cmd app
+.\run.cmd terminal
+.\run.cmd start
+.\run.cmd logs
+.\run.cmd test
+.\run.cmd config
+```
+
+The menu offers those actions plus stop/restart/status/train. `app` runs in the foreground; if the app already runs as a service it shows the service logs instead of starting a duplicate controller. `start` installs/starts the user service at the chosen path. `config` edits the Pi's `.env`. `terminal` opens an interactive Pi shell in that folder. Ctrl+C stops a foreground session; a user service continues independently.
+
+For boot without a login, enable lingering once in the Pi terminal as described in section 7. Existing instructions using `~/Can_ids` refer to a normal Git clone; replace that directory with your chosen sync destination. See [all sync options, recovery and GitHub push steps](docs/pi-sync.md).
+
+**GitHub publication is separate:** after reviewing and committing local changes, `git push origin main` publishes them. The sync runner creates source commits by default, but never pushes to GitHub automatically or requires you to stage edits manually. Publish from the laptop after a successful sync with `git push origin main`; Pi commits form a separate local deployment history. `scripts/update.sh` remains an optional Git-pull workflow for a separate Git-managed Pi checkout; use one deployment method per folder.
 
 ## 7. Run automatically after boot
 
