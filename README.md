@@ -14,12 +14,20 @@ A Raspberry Pi gateway controls three ESP32 ECUs over CAN at 500 kbit/s. Its Fla
 | Rule mode (ML off) | Detects the **configured demo client**, or a registered USB demo whose configured destination responds to a ping |
 | ML mode (toggle on) | Isolation Forest replaces the rule trigger; eight features over a two-second CAN window |
 | State machine | `NORMAL → COUNTDOWN → BLOCKED`; condition must clear for the rearm cooldown |
-| Network containment | HTTP 403 on the blocked client's joystick/solenoid requests; monitoring and SSH stay reachable |
-| CAN containment | Stops the motor and refuses all joystick/solenoid requests while contained; it does not filter CAN frames on the wire |
+| Network containment | HTTP 403 on the blocked client's joystick, solenoid and ML-toggle requests; monitoring and SSH stay reachable |
+| CAN containment | Stops the motor and refuses all control/ML-toggle requests while contained; it does not filter CAN frames on the wire |
 | Control loss | Pi stops stale joystick commands after `JOYSTICK_TIMEOUT`; Motor ECU also has a 500 ms CAN-command timeout |
-| Offline code | `ids/` contains training/evaluation utilities, including Random Forest; those bundles are not the live gateway's model format |
+| Offline code | Experimental `ids/` training/evaluation utilities, including Random Forest; feature arithmetic delegates to `can_features.py`, but its bundles/policy engine are not used by the live gateway |
 
 This is a lab demonstration, with no measured accuracy or inference-latency claim. MQTT, key rotation and rolling-counter authentication are not implemented. A known client's presence is a demonstration trigger, not a general classifier of malicious Wi-Fi activity. The dashboard has no user login; keep it on the trusted test network.
+
+### Access and server model
+
+The joystick, solenoid and ML toggle are unauthenticated. Any reachable client can control the testbed before containment; an IP-based block is not user authentication. The default `APP_HOST=0.0.0.0` listens on every IPv4 interface, including management Wi-Fi, not just the Vehicle-IDS AP. Use an isolated lab network and an appropriate bind address; do not publish the port or forward it from the internet. `APP_HOST=127.0.0.1` with the documented SSH tunnel restricts dashboard access to the Pi/tunnel. There is no general origin policy or CSRF token; JSON content-type checks do not replace authentication.
+
+The default Flask development server is for this lab demonstration. For the optional threaded Waitress server, install `.venv/bin/python -m pip install -r requirements-server.txt`, set `APP_SERVER=waitress` in `.env`, and start with the existing runner/service (`python app.py`). This keeps the CAN/IDS worker threads in the same process as the web server. Do not launch `waitress-serve app:app` or a multi-worker WSGI command: importing `app` alone does not start the controller threads, and multiple controllers compete for CAN/state. See [Waitress usage](https://docs.pylonsproject.org/projects/waitress/en/stable/usage.html).
+
+Ctrl+C, SIGTERM and normal interpreter exit release the CAN bus; cleanup and sends share a lock. Power loss/SIGKILL cannot run cleanup, so the motor ECU's independent command timeout remains necessary.
 
 ```mermaid
 flowchart TD
@@ -163,7 +171,7 @@ See [CAN ID map and firmware notes](docs/hardware-and-can.md).
 
 1. Start the app, then open `http://PI_LAN_IP:5000` on the home network, `http://10.50.0.1:5000` on the lab AP, or `http://localhost:5000` through the SSH tunnel.
 2. Check motor/sensor/security node dots and distances. Missing heartbeats go offline after two seconds. Check `can_up` in `/api/state` if hardware is absent.
-3. Drag and **hold** the joystick to move; release, cancel, switch away or lose the browser connection to stop. The browser refreshes the held position every 200 ms. Test with wheels raised first.
+3. Drag and **hold** the joystick to move; release, cancel, switch away or lose the browser connection to stop. Movement requests are coalesced at up to 20 Hz, with a held-position refresh every 200 ms. STOP bypasses the throttle and follows any in-flight request; a stalled request is covered by the Pi/ECU timeouts. Test with wheels raised first.
 4. Use lock ON/OFF for the security ECU. The response confirms the request, not physical actuation; verify the returned lock status.
 5. Keep **ML off** for the Wi-Fi/USB demo. The designated AP client's presence starts the countdown; controls from that client return HTTP 403 after the delay. Disconnect it and wait `REARM_COOLDOWN` seconds for rearm.
 6. For the CAN ML demo, first generate the compatible model, then enable the ML toggle. While enabled, CAN anomaly scoring replaces the Wi-Fi/USB trigger. A sustained anomaly leads to motor stop and global control refusal until the condition clears and rearm completes.
@@ -287,12 +295,12 @@ This generates a service with your actual checkout path and user. It runs Flask 
 
 | Path | Purpose |
 |---|---|
-| `app.py`, `templates/`, `can_features.py` | Live controller, dashboard and shared live/training features |
+| `app.py`, `templates/`, `can_features.py`, `project_config.py` | Live controller, dashboard, common feature arithmetic and paths |
 | `train_can_ids_model.py` | Compatible synthetic-baseline trainer |
 | `esp32/`, `can/` | Firmware and Pi CAN link setup |
 | `scripts/` | Installation, networking, service generation, deployment and health checks |
 | `usb/` | Optional fixed lab payload and registered-device monitor |
-| `ids/`, `data/`, `models/` | Separate offline training/evaluation code and data/model notes |
+| `ids/`, `data/`, `models/` | Experimental offline training/evaluation; local rate overrides stay separate from the live baseline; bundles remain incompatible with the live loader |
 | `tests/` | Hardware-independent Flask, CAN and configuration checks |
 | `docs/` | Hardware photos, operating guides, historical comparisons and verification limits |
 
@@ -307,6 +315,33 @@ git switch main
 The GitHub tree already contained no ZIP files. The update removes the unused `app/` Flask stub, moves its working dashboard into `templates/`, and replaces obsolete hard-coded setup/service files with generated per-device configuration. No original local project folders or archives need deleting.
 
 **Validation:** [test results and Pi-only checks](docs/verification.md). Historical `implementation-comparison.md` and `reference-comparison.md` are design context, not measured validation of this version.
+
+The [review follow-up](docs/code-review-followup.md) records corrected review claims, fixes and remaining hardware evidence. Developer checks: `python -m pip install -r requirements-dev.txt`, `python -m unittest discover -s tests -v`, `python -m ruff check .` and `node --test tests/dashboard.test.cjs`. Node is needed for developer/CI dashboard tests, not for running the Pi controller.
+
+## Latest software validation — 22 November 2026
+
+**54 Python tests and four dashboard JavaScript tests passed locally.** Python compilation and Git whitespace checks also passed. Tests cover virtual-CAN commands, invalid input, command/containment races, mode changes during scoring, timeout STOP, snapshots, shared features, interrupted model replacement and source synchronization.
+
+Training creates missing output directories and replaces the saved model only after a complete write. A failed save leaves the previous model intact. Restart the gateway after retraining to load the new bundle. Monitor results from an older detection-mode generation are discarded, including an OFF/ON switch during scoring. Boolean joystick coordinates are rejected. The Sensor ECU reports the existing `0xFFFF` unknown-distance value when ToF initialization fails or the reading is invalid.
+
+Fresh package installation remains blocked in this execution environment; tests used existing compatible dependencies and official python-can source. Ruff, optional Waitress runtime, Bash execution and ESP32 compilation remain unverified locally. Hardware accuracy, latency and physical actuation still require the Pi/ESP32 testbed; synthetic trainer results are smoke checks only.
+
+### Publish local changes from Windows
+
+Run in PowerShell after reviewing `git diff`. These commands stop if a Git step fails and never force-push:
+
+```powershell
+Set-Location 'D:\My Projects\embed_proj\Can_ids-update-20261122'
+git add -A
+if ($LASTEXITCODE -ne 0) { throw 'Staging failed' }
+git commit -m "Fix CAN IDS concurrency, validation and model persistence"
+if ($LASTEXITCODE -ne 0) { throw 'Commit failed; inspect git status' }
+git pull --rebase origin main
+if ($LASTEXITCODE -ne 0) { throw 'Resolve the rebase before pushing' }
+git push origin main
+```
+
+Existing ignore rules exclude `.env`, `.venv`, generated models and runtime files. GitHub publication does not update the Pi or flash the ESP32s; use the documented Pi runner and Arduino flashing workflow separately.
 
 ## Hardware gallery
 

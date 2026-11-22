@@ -17,6 +17,8 @@ works) while can0 is down -- see can0_setup.sh to bring it up.
 The CAN ML anomaly toggle needs can_ids_model.joblib next to this file --
 generate it once with: python3 train_can_ids_model.py
 """
+import atexit
+import copy
 import can
 import collections
 import json
@@ -28,18 +30,12 @@ import signal
 import subprocess
 import threading
 import time
-from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, render_template
+from project_config import PROJECT_ROOT, project_path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 # A real process environment takes precedence over the per-device .env file.
 load_dotenv(PROJECT_ROOT / ".env", override=False)
-
-def project_path(name, default):
-    value = Path(os.environ.get(name, default)).expanduser()
-    return str(value if value.is_absolute() else PROJECT_ROOT / value)
-
 
 from can_features import WINDOW_SECONDS as ML_WINDOW_SECONDS, FEATURE_NAMES, extract_features
 
@@ -92,7 +88,7 @@ ID_LOCK_STATUS          = 0x141  # Security ECU -> Pi
 
 CAN_CHANNEL = os.environ.get("CAN_CHANNEL", "can0")
 CAN_BACKEND = os.environ.get("CAN_BACKEND", "socketcan")
-CONTROL_PATHS = {"/api/joystick", "/api/solenoid"}  # endpoints refused for a blocked attacker
+CONTROL_PATHS = {"/api/joystick", "/api/solenoid", "/api/ml/toggle"}
 
 # ---------------- CAN ML anomaly detection (Isolation Forest, see train_can_ids_model.py) ----------------
 ML_MODEL_PATH = project_path("ML_MODEL_PATH", "can_ids_model.joblib")
@@ -100,7 +96,6 @@ ml_bundle = None          # {"scaler", "model", "feature_names", "window_seconds
 ml_load_error = None
 try:
     import joblib
-    import numpy as np
 except ImportError as e:
     joblib = None
     ml_load_error = f"scikit-learn/numpy/joblib not installed ({e})"
@@ -156,6 +151,9 @@ def ml_score_now():
     if ml_bundle is None:
         return None, False
     with can_window_lock:
+        cutoff = time.time() - ml_bundle["window_seconds"]
+        while can_window and can_window[0][0] < cutoff:
+            can_window.popleft()
         frames = list(can_window)
     feats = extract_features(frames, ml_bundle["window_seconds"])
     x = ml_bundle["scaler"].transform([feats])
@@ -168,33 +166,60 @@ app = Flask(__name__, template_folder=str(PROJECT_ROOT / "templates"))
 # ---------------- CAN bus (opened lazily, re-opened if can0 goes away) ----------------
 bus = None
 _can_err_logged = False
+bus_lock = threading.Lock()  # creation, sends and shutdown never overlap
+stop_event = threading.Event()
+motor_lock = threading.RLock()  # motor first; state/security/bus locks are taken separately
 
 
 def get_bus():
     """Return the open CAN bus, or try to open it. Returns None while can0 is unavailable."""
     global bus, _can_err_logged
-    if bus is None:
-        try:
-            bus = can.interface.Bus(channel=CAN_CHANNEL, interface=CAN_BACKEND)
-            _can_err_logged = False
-            log.info("CAN: %s opened", CAN_CHANNEL)
-        except Exception as e:  # can0 missing / down
-            if not _can_err_logged:
-                log.warning("CAN: %s unavailable (%s) -- retrying every 3 s", CAN_CHANNEL, e)
-                _can_err_logged = True
-            bus = None
-    return bus
+    with bus_lock:
+        if stop_event.is_set():
+            return None
+        if bus is None:
+            try:
+                bus = can.interface.Bus(channel=CAN_CHANNEL, interface=CAN_BACKEND)
+                _can_err_logged = False
+                log.info("CAN: %s opened", CAN_CHANNEL)
+            except Exception as e:  # can0 missing / down
+                if not _can_err_logged:
+                    log.warning("CAN: %s unavailable (%s) -- retrying every 3 s", CAN_CHANNEL, e)
+                    _can_err_logged = True
+                bus = None
+        return bus
 
 
 def can_send(msg):
-    b = bus
-    if b is None:
-        return False
-    try:
-        b.send(msg)
-        return True
-    except (can.CanError, OSError):
-        return False
+    with bus_lock:
+        if bus is None or stop_event.is_set():
+            return False
+        try:
+            bus.send(msg, timeout=0.1)
+            return True
+        except (can.CanError, OSError):
+            return False
+
+
+def close_bus(expected=None):
+    """Close once; a stale receive failure must not close a replacement bus."""
+    global bus
+    with bus_lock:
+        if bus is None or (expected is not None and bus is not expected):
+            return
+        closing, bus = bus, None
+        try:
+            closing.shutdown()
+        except Exception as error:
+            log.warning("CAN shutdown failed: %s", error)
+
+
+def shutdown():
+    stop_event.set()
+    close_bus()
+
+
+atexit.register(shutdown)
 
 
 state_lock = threading.Lock()
@@ -254,6 +279,7 @@ _deadline = 0.0
 blocked_ips = set()
 attacker_http_last = 0.0
 last_motor_source = None
+_detection_generation = 0
 
 
 def run(cmd, timeout=3):
@@ -391,6 +417,13 @@ def cancel_intrusion_cycle(reason):
 
 
 def execute_block(ip):
+    # Serialize containment with control requests and motor keep-alives. Requests
+    # that passed before_request must recheck the block after taking this lock.
+    with motor_lock:
+        _execute_block(ip)
+
+
+def _execute_block(ip):
     """The project's block action. Enforced at the application layer: every control endpoint
     now refuses this attacker (HTTP 403) while the dashboard/state endpoints stay reachable so
     the attacker's own page can show BLOCKED. No iptables/nftables rules are added, so the
@@ -417,11 +450,13 @@ def execute_block(ip):
             log.warning("USB demo payload (pid %s) sent SIGTERM as part of containment", pid)
         except (ProcessLookupError, ValueError, PermissionError) as e:
             log.info("USB demo payload not stopped (%s) — likely already exited", e)
+    with state_lock:
+        cmd, source = last_motor_cmd, last_motor_source
     if reason == "CAN_ANOMALY":
-        if last_motor_cmd not in (None, "S"):
+        if cmd not in (None, "S"):
             send_motor_command("S")
             log.warning("Motor set to STOP: CAN anomaly containment")
-    elif last_motor_source == ip and last_motor_cmd not in (None, "S"):
+    elif source == ip and cmd not in (None, "S"):
         send_motor_command("S")
         log.warning("Motor set to STOP: last drive command came from the blocked attacker")
 
@@ -480,10 +515,11 @@ def monitor_tick(now=None):
 
     with security_lock:
         ip = security["attacker_ip"]
+        http_last = attacker_http_last
     present = False
     if iface["active"]:
         present, ip = probe_attacker()
-        if attacker_http_last and now - attacker_http_last < HTTP_PRESENCE_WINDOW:
+        if http_last and now - http_last < HTTP_PRESENCE_WINDOW:
             present = True
 
     usb = read_usb_state(now)
@@ -496,121 +532,128 @@ def monitor_tick(now=None):
 
     with security_lock:
         ml_enabled = security["ml"]["enabled"]
+        generation = _detection_generation
     if ml_bundle is None:
         load_ml_model()   # cheap after the first successful/failed attempt; keeps "available" accurate even when disabled
     ml_score, ml_anomaly = (None, False)
     if ml_enabled:
         ml_score, ml_anomaly = ml_score_now()
-    with security_lock:
-        security["ml"]["available"] = ml_bundle is not None
-        security["ml"]["error"] = ml_load_error if ml_bundle is None else None
-        security["ml"]["score"] = ml_score
-        security["ml"]["anomaly"] = ml_anomaly
-
-    key = _iface_key(iface)
-    if key != _mon["iface_state"]:
-        log.info("%s: %s -> %s", AP_IFACE, _mon["iface_state"] or "UNKNOWN", key)
-        _mon["iface_state"] = key
-    if present != _mon["present"]:
-        log.info("Attacker %s on %s: %s", ip, AP_IFACE, "PRESENT" if present else "not present")
-        _mon["present"] = present
-    if usb["status"] != _mon.get("usb_status"):
-        log.info("USB attack vector: %s (device=%s)", usb["status"], usb["device"])
-        _mon["usb_status"] = usb["status"]
-
-    with security_lock:
-        security["attacker_ip"] = ip
-        security["attacker_present"] = present
-        security["wlan1"] = {"iface": AP_IFACE, "state": key, "ip": AP_IP if iface["active"] else None}
-        # The USB state file is the source of truth for present/attack_triggered/device/pid, but
-        # once the IDS has blocked a USB-triggered attack, that containment (BLOCKED) must stick
-        # on the dashboard even though the file itself still says MONITORING/ATTACK_TRIGGERED --
-        # only a fresh insertion (a new event_id) or a rearm should move it off BLOCKED.
-        was_blocked = (security["phase"] == "BLOCKED" and security["detection_reason"] == "USB_ATTACK"
-                       and security["usb"]["status"] == "BLOCKED")
-        same_payload = was_blocked and usb.get("present") and (
-            usb.get("event_id") == security["usb"].get("event_id") if usb.get("event_id")
-            else usb.get("payload_pid") == security["usb"].get("payload_pid"))
-        if same_payload:
-            usb["status"] = "BLOCKED"
-        security["usb"] = usb
-        phase = security["phase"]
-
-    condition_net = iface["active"] and present
-    condition_usb = usb_reachable
-    if ml_enabled:
-        # ML fully replaces rule-based detection while the toggle is ON: the network/USB
-        # conditions are still computed above (so their dashboard rows stay live for
-        # comparison) but cannot start/sustain/cancel a cycle while ML governs it.
-        condition = ml_anomaly
-        reason = "CAN_ANOMALY"
-        detect_ip = None
-    else:
-        condition = condition_net or condition_usb
-        reason = "NETWORK_ATTACKER_PRESENT" if condition_net else ("USB_ATTACK" if condition_usb else None)
-        detect_ip = ip if condition_net else ATTACKER_IP
-
-    if phase == "NORMAL":
-        if condition:
-            start_intrusion_cycle(detect_ip, reason, now)
-        else:
-            with security_lock:   # keep the event line informative without falsely raising UNSAFE
-                if not iface["active"]:
-                    security["last_event"] = f"{AP_IFACE} not active ({key}) — monitoring, will recover automatically"
-                elif security["last_event"].startswith(AP_IFACE):
-                    security["last_event"] = "System nominal — no intrusions detected"
-            _mon["absent_ticks"] = 0
-
-    elif phase == "COUNTDOWN":
+    # Probing/scoring runs outside the command lock. Discard results if a
+    # mode switch happened meanwhile; never revive an obsolete countdown.
+    with motor_lock:
         with security_lock:
-            active_ip, active_reason = security["detected_ip"], security["detection_reason"]
-        if active_reason == "USB_ATTACK":
-            still_active = condition_usb
-        elif active_reason == "CAN_ANOMALY":
-            still_active = ml_anomaly
+            if generation != _detection_generation:
+                return
+        with security_lock:
+            security["ml"]["available"] = ml_bundle is not None
+            security["ml"]["error"] = ml_load_error if ml_bundle is None else None
+            security["ml"]["score"] = ml_score
+            security["ml"]["anomaly"] = ml_anomaly
+
+        key = _iface_key(iface)
+        if key != _mon["iface_state"]:
+            log.info("%s: %s -> %s", AP_IFACE, _mon["iface_state"] or "UNKNOWN", key)
+            _mon["iface_state"] = key
+        if present != _mon["present"]:
+            log.info("Attacker %s on %s: %s", ip, AP_IFACE, "PRESENT" if present else "not present")
+            _mon["present"] = present
+        if usb["status"] != _mon.get("usb_status"):
+            log.info("USB attack vector: %s (device=%s)", usb["status"], usb["device"])
+            _mon["usb_status"] = usb["status"]
+
+        with security_lock:
+            security["attacker_ip"] = ip
+            security["attacker_present"] = present
+            security["wlan1"] = {"iface": AP_IFACE, "state": key, "ip": AP_IP if iface["active"] else None}
+            # The USB state file is the source of truth for present/attack_triggered/device/pid, but
+            # once the IDS has blocked a USB-triggered attack, that containment (BLOCKED) must stick
+            # on the dashboard even though the file itself still says MONITORING/ATTACK_TRIGGERED --
+            # only a fresh insertion (a new event_id) or a rearm should move it off BLOCKED.
+            was_blocked = (security["phase"] == "BLOCKED" and security["detection_reason"] == "USB_ATTACK"
+                           and security["usb"]["status"] == "BLOCKED")
+            same_payload = was_blocked and usb.get("present") and (
+                usb.get("event_id") == security["usb"].get("event_id") if usb.get("event_id")
+                else usb.get("payload_pid") == security["usb"].get("payload_pid"))
+            if same_payload:
+                usb["status"] = "BLOCKED"
+            security["usb"] = usb
+            phase = security["phase"]
+
+        condition_net = iface["active"] and present
+        condition_usb = usb_reachable
+        if ml_enabled:
+            # ML fully replaces rule-based detection while the toggle is ON: the network/USB
+            # conditions are still computed above (so their dashboard rows stay live for
+            # comparison) but cannot start/sustain/cancel a cycle while ML governs it.
+            condition = ml_anomaly
+            reason = "CAN_ANOMALY"
+            detect_ip = None
         else:
-            still_active = condition_net
-        if still_active:
-            _mon["absent_ticks"] = 0
-            if update_countdown(now) <= 0:
-                execute_block(active_ip)
-                _mon["absent_since"] = None
-        else:
-            _mon["absent_ticks"] += 1
-            if _mon["absent_ticks"] >= ABSENT_TICKS_BEFORE_CANCEL:
-                cancel_intrusion_cycle(
-                    f"{AP_IFACE} lost before block — countdown cancelled" if active_reason == "NETWORK_ATTACKER_PRESENT" and not iface["active"]
-                    else f"USB attack traffic to {active_ip} stopped before block — countdown cancelled (NOT blocked)" if active_reason == "USB_ATTACK"
-                    else "CAN anomaly cleared before block — countdown cancelled (NOT blocked)" if active_reason == "CAN_ANOMALY"
-                    else f"Attacker {active_ip} disconnected before block — countdown cancelled (NOT blocked)")
+            condition = condition_net or condition_usb
+            reason = "NETWORK_ATTACKER_PRESENT" if condition_net else ("USB_ATTACK" if condition_usb else None)
+            detect_ip = ip if condition_net else ATTACKER_IP
+
+        if phase == "NORMAL":
+            if condition:
+                start_intrusion_cycle(detect_ip, reason, now)
+            else:
+                with security_lock:   # keep the event line informative without falsely raising UNSAFE
+                    if not iface["active"]:
+                        security["last_event"] = f"{AP_IFACE} not active ({key}) — monitoring, will recover automatically"
+                    elif security["last_event"].startswith(AP_IFACE):
+                        security["last_event"] = "System nominal — no intrusions detected"
                 _mon["absent_ticks"] = 0
 
-    elif phase == "BLOCKED":
-        if condition:
-            _mon["absent_since"] = None
-        else:
-            _mon["absent_since"] = _mon["absent_since"] or now
-            if now - _mon["absent_since"] >= REARM_COOLDOWN:
-                rearm("Attacker left the Vehicle-IDS network — system re-armed")
-                _mon["absent_since"] = None
+        elif phase == "COUNTDOWN":
+            with security_lock:
+                active_ip, active_reason = security["detected_ip"], security["detection_reason"]
+            if active_reason == "USB_ATTACK":
+                still_active = condition_usb
+            elif active_reason == "CAN_ANOMALY":
+                still_active = ml_anomaly
+            else:
+                still_active = condition_net
+            if still_active:
+                _mon["absent_ticks"] = 0
+                if update_countdown(now) <= 0:
+                    execute_block(active_ip)
+                    _mon["absent_since"] = None
+            else:
+                _mon["absent_ticks"] += 1
+                if _mon["absent_ticks"] >= ABSENT_TICKS_BEFORE_CANCEL:
+                    cancel_intrusion_cycle(
+                        f"{AP_IFACE} lost before block — countdown cancelled" if active_reason == "NETWORK_ATTACKER_PRESENT" and not iface["active"]
+                        else f"USB attack traffic to {active_ip} stopped before block — countdown cancelled (NOT blocked)" if active_reason == "USB_ATTACK"
+                        else "CAN anomaly cleared before block — countdown cancelled (NOT blocked)" if active_reason == "CAN_ANOMALY"
+                        else f"Attacker {active_ip} disconnected before block — countdown cancelled (NOT blocked)")
+                    _mon["absent_ticks"] = 0
 
-    if now - _mon["last_status"] >= STATUS_LOG_INTERVAL:
-        _mon["last_status"] = now
-        with security_lock:
-            log.info("[status] %s=%s attacker=%s usb=%s phase=%s%s hostapd=%s dnsmasq=%s can=%s",
-                     AP_IFACE, key, "PRESENT" if present else "absent", security["usb"]["status"], security["phase"],
-                     f"({security['seconds_remaining']}s, {security['detection_reason']})" if security["phase"] == "COUNTDOWN" else "",
-                     security["hostapd"], security["dnsmasq"], "up" if state["can_up"] else "DOWN")
+        elif phase == "BLOCKED":
+            if condition:
+                _mon["absent_since"] = None
+            else:
+                _mon["absent_since"] = _mon["absent_since"] or now
+                if now - _mon["absent_since"] >= REARM_COOLDOWN:
+                    rearm("Attacker left the Vehicle-IDS network — system re-armed")
+                    _mon["absent_since"] = None
+
+        if now - _mon["last_status"] >= STATUS_LOG_INTERVAL:
+            _mon["last_status"] = now
+            with security_lock:
+                log.info("[status] %s=%s attacker=%s usb=%s phase=%s%s hostapd=%s dnsmasq=%s can=%s",
+                         AP_IFACE, key, "PRESENT" if present else "absent", security["usb"]["status"], security["phase"],
+                         f"({security['seconds_remaining']}s, {security['detection_reason']})" if security["phase"] == "COUNTDOWN" else "",
+                         security["hostapd"], security["dnsmasq"], "up" if state["can_up"] else "DOWN")
 
 
 def monitor_loop():
-    while True:
+    while not stop_event.is_set():
         t0 = time.time()
         try:
             monitor_tick()
         except Exception:
             log.exception("monitor tick failed (continuing)")
-        time.sleep(max(0.05, POLL_INTERVAL - (time.time() - t0)))
+        stop_event.wait(max(0.05, POLL_INTERVAL - (time.time() - t0)))
 
 
 # ---------------- CAN receive ----------------
@@ -667,42 +710,37 @@ def handle_can_message(msg):
 def can_rx_loop():
     """Runs forever in a background thread, updating shared state from CAN traffic.
     Re-opens can0 if it was not available at start or disappears later."""
-    global bus
-    while True:
+    while not stop_event.is_set():
         b = get_bus()
         with state_lock:
             state["can_up"] = b is not None
         if b is None:
-            time.sleep(3)
+            stop_event.wait(3)
             continue
         try:
             msg = b.recv(timeout=1.0)
         except (can.CanError, OSError) as e:
             log.warning("CAN receive error (%s) -- will re-open %s", e, CAN_CHANNEL)
-            try:
-                b.shutdown()
-            except Exception:
-                pass
-            bus = None
+            close_bus(expected=b)
             continue
         if msg is not None:
             handle_can_message(msg)
 
 
 def node_timeout_watcher():
-    while True:
+    while not stop_event.is_set():
         now = time.time()
         with state_lock:
             for n in state["nodes"].values():
                 if n["online"] and now - n["last_seen"] > NODE_TIMEOUT:
                     n["online"] = False
-        time.sleep(0.5)
+        stop_event.wait(0.5)
 
 
 def pi_heartbeat_loop():
-    while True:
+    while not stop_event.is_set():
         can_send(can.Message(arbitration_id=ID_PI_HEARTBEAT, data=[1], is_extended_id=False))
-        time.sleep(0.5)
+        stop_event.wait(0.5)
 
 
 # ---------------- Motor joystick -> discrete command ----------------
@@ -725,19 +763,23 @@ def joystick_to_command(x, y):
 
 def send_motor_command(cmd):
     global last_motor_cmd, last_motor_send_time
-    can_send(can.Message(arbitration_id=ID_MOTOR_CMD, data=[ord(cmd)], is_extended_id=False))
-    with state_lock:
-        state["motor_cmd"] = cmd
-    last_motor_cmd = cmd
-    last_motor_send_time = time.time()
+    with motor_lock:
+        can_send(can.Message(arbitration_id=ID_MOTOR_CMD, data=[ord(cmd)], is_extended_id=False))
+        with state_lock:
+            state["motor_cmd"] = cmd
+            last_motor_cmd = cmd
+            last_motor_send_time = time.time()
 
 
 def motor_keepalive_loop():
-    while True:
-        if last_motor_cmd not in (None, "S") and time.time() - last_joystick_time > JOYSTICK_TIMEOUT:
-            send_motor_command("S")
-        if last_motor_cmd is not None and time.time() - last_motor_send_time > MOTOR_RESEND_INTERVAL:
-            send_motor_command(last_motor_cmd)
+    while not stop_event.is_set():
+        with motor_lock:
+            with state_lock:
+                cmd, sent, joystick = last_motor_cmd, last_motor_send_time, last_joystick_time
+            if cmd not in (None, "S") and time.time() - joystick > JOYSTICK_TIMEOUT:
+                send_motor_command("S")
+            elif cmd is not None and time.time() - sent > MOTOR_RESEND_INTERVAL:
+                send_motor_command(cmd)
         time.sleep(0.05)
 
 
@@ -750,14 +792,19 @@ def _client_hook():
     global attacker_http_last
     addr = request.remote_addr
     with security_lock:
-        attacker_ip = security["attacker_ip"]
-        is_blocked = addr in blocked_ips
+        if addr == security["attacker_ip"]:
+            attacker_http_last = time.time()
+    if request.path in CONTROL_PATHS:
+        return control_refusal()
+
+
+def control_refusal():
+    with security_lock:
         can_contained = security["phase"] == "BLOCKED" and security["detection_reason"] == "CAN_ANOMALY"
-    if can_contained and request.path in CONTROL_PATHS:
+        is_blocked = request.remote_addr in blocked_ips
+    if can_contained:
         return jsonify({"error": "CAN anomaly contained; controls disabled until rearm"}), 403
-    if addr == attacker_ip:
-        attacker_http_last = time.time()
-    if is_blocked and request.path in CONTROL_PATHS:
+    if is_blocked:
         return jsonify({"error": "blocked"}), 403
 
 
@@ -773,29 +820,51 @@ def api_joystick():
     try:
         if not isinstance(body, dict):
             raise ValueError()
+        if any(isinstance(body.get(key), bool) for key in ("x", "y")):
+            raise ValueError()
         x, y = float(body.get("x", 0)), float(body.get("y", 0))
         if not all(math.isfinite(v) and -100 <= v <= 100 for v in (x, y)):
             raise ValueError()
     except (ValueError, TypeError):
         return jsonify({"error": "x and y must be finite numbers between -100 and 100"}), 400
-    last_joystick_time = time.time()
     cmd = joystick_to_command(x, y)
-    last_motor_source = request.remote_addr
-    send_motor_command(cmd)
+    with motor_lock:
+        refusal = control_refusal()
+        if refusal is not None:
+            return refusal
+        with state_lock:
+            last_joystick_time = time.time()
+            last_motor_source = request.remote_addr
+        send_motor_command(cmd)
     return jsonify({"cmd": cmd})
 
 
 @app.route("/api/solenoid", methods=["POST"])
 def api_solenoid():
-    body = request.get_json(force=True)
-    on = bool(body.get("on"))
-    can_send(can.Message(arbitration_id=ID_LOCK_CMD, data=[1 if on else 0], is_extended_id=False))
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("on"), bool):
+        return jsonify({"error": "JSON object with boolean 'on' required"}), 400
+    on = body["on"]
+    with motor_lock:
+        refusal = control_refusal()
+        if refusal is not None:
+            return refusal
+        can_send(can.Message(arbitration_id=ID_LOCK_CMD, data=[1 if on else 0], is_extended_id=False))
     return jsonify({"requested": "ON" if on else "OFF"})
 
 
 @app.route("/api/ml/toggle", methods=["POST"])
 def api_ml_toggle():
-    body = request.get_json(force=True, silent=True) or {}
+    with motor_lock:
+        refusal = control_refusal()
+        if refusal is not None:
+            return refusal
+        return _toggle_ml()
+
+
+def _toggle_ml():
+    global _detection_generation
+    body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
         return jsonify({"error": "enabled must be a JSON boolean"}), 400
     enabled = bool(body.get("enabled"))
@@ -807,6 +876,7 @@ def api_ml_toggle():
         if security["ml"]["enabled"] == enabled:
             return jsonify(dict(security["ml"]))
         security["ml"]["enabled"] = enabled
+        _detection_generation += 1
         mid_cycle = security["phase"] != "NORMAL"
     log.warning("ML toggle -> %s", "ON" if enabled else "OFF")
     if mid_cycle:
@@ -823,9 +893,9 @@ def api_ml_toggle():
 def api_state():
     addr = request.remote_addr
     with state_lock:
-        snapshot = dict(state)
+        snapshot = copy.deepcopy(state)
     with security_lock:
-        snapshot["security"] = dict(security)
+        snapshot["security"] = copy.deepcopy(security)
         is_attacker = addr == security["attacker_ip"]
         blocked = security["phase"] == "BLOCKED" and (addr in blocked_ips or security["detection_reason"] == "CAN_ANOMALY")
     snapshot["you"] = {"is_attacker": is_attacker, "blocked": blocked}
@@ -840,6 +910,20 @@ if __name__ == "__main__":
     threading.Thread(target=pi_heartbeat_loop, daemon=True).start()
     threading.Thread(target=motor_keepalive_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
-    app.run(host=os.environ.get("APP_HOST", "0.0.0.0"),
-            port=int(os.environ.get("APP_PORT", "5000")),
-            threaded=True, debug=False, use_reloader=False)
+    def terminate(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        host = os.environ.get("APP_HOST", "0.0.0.0")
+        port = int(os.environ.get("APP_PORT", "5000"))
+        server = os.environ.get("APP_SERVER", "flask")
+        if server == "waitress":
+            from waitress import serve
+            serve(app, host=host, port=port, threads=4)
+        elif server == "flask":
+            app.run(host=host, port=port, threaded=True, debug=False, use_reloader=False)
+        else:
+            raise ValueError("APP_SERVER must be flask or waitress")
+    finally:
+        shutdown()

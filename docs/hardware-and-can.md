@@ -2,6 +2,8 @@
 
 All supplied ESP32 sketches use SPI SCK=18, MISO=19, MOSI=23, MCP2515 CS=5 and INT=4. Confirm each sketch before wiring. They call `CAN_500KBPS` with `MCP_8MHZ`; this must match the crystal on each ESP32-side CAN module. The Pi overlay must independently match the Pi-side module.
 
+The Sensor ECU broadcasts ToF, ultrasonic distances and obstacle flags. Its unused MPU6050 initialization and direct library includes were removed; no IMU data is sampled or sent, and no IMU CAN ID is defined. Historical wiring/photos may still show that module. Reflash the revised sketch to apply the firmware cleanup.
+
 | CAN ID | Meaning | Direction |
 |---|---|---|
 | `0x010` | Pi heartbeat | Pi → bus |

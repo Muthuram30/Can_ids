@@ -6,9 +6,11 @@ import copy
 import importlib.util
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path, PurePosixPath
@@ -46,6 +48,8 @@ class GatewayTests(unittest.TestCase):
         gateway.last_motor_source = None
         gateway.last_joystick_time = 0
         gateway.attacker_http_last = 0
+        gateway.stop_event.clear()
+        gateway.can_window.clear()
         gateway._mon.update(iface_state=None, present=None, absent_ticks=0,
                             absent_since=None, last_svc=0, last_status=0)
         self.tx = can.Bus(interface="virtual", channel=self.id())
@@ -73,10 +77,149 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual((message.arbitration_id, bytes(message.data)), (0x100, b"F"))
 
     def test_bad_joystick_requests_return_400(self):
-        for body in (None, [], {"x": "bad"}, {"x": 101}, {"y": float("nan")}, {"x": float("inf")}):
+        for body in (None, [], {"x": "bad"}, {"x": True}, {"y": False}, {"x": 101}, {"y": float("nan")}, {"x": float("inf")}):
             with self.subTest(body=body):
                 self.assertEqual(self.client.post("/api/joystick", json=body).status_code, 400)
         self.assertIsNone(self.rx.recv(0.01))
+
+    def test_solenoid_requires_an_explicit_json_boolean(self):
+        for body in (None, [], {}, {"on": "false"}, {"on": 0}, {"on": 1}, {"on": None}):
+            with self.subTest(body=body):
+                self.assertEqual(self.client.post("/api/solenoid", json=body).status_code, 400)
+        self.assertEqual(self.client.post("/api/solenoid", data="{bad", content_type="application/json").status_code, 400)
+        self.assertIsNone(self.rx.recv(0.01))
+        for on in (True, False):
+            response = self.client.post("/api/solenoid", json={"on": on})
+            self.assertEqual(response.status_code, 200)
+            msg = self.rx.recv(0.2)
+            self.assertEqual((msg.arbitration_id, bytes(msg.data)), (0x140, bytes([on])))
+
+    def test_state_snapshot_has_no_nested_live_references(self):
+        original_jsonify = gateway.jsonify
+
+        def update_before_serialization(snapshot):
+            gateway.state["nodes"]["motor"]["online"] = True
+            gateway.security["ml"]["score"] = -10
+            gateway.security["usb"]["status"] = "CHANGED"
+            return original_jsonify(snapshot)
+
+        with patch.object(gateway, "jsonify", side_effect=update_before_serialization):
+            snapshot = self.client.get("/api/state").get_json()
+        self.assertFalse(snapshot["nodes"]["motor"]["online"])
+        self.assertIsNone(snapshot["security"]["ml"]["score"])
+        self.assertEqual(snapshot["security"]["usb"]["status"], "IDLE")
+
+    def test_request_already_validated_cannot_restart_motor_after_block(self):
+        validated = threading.Event()
+        result = []
+
+        def request_in_thread():
+            with gateway.app.test_client() as client:
+                result.append(client.post("/api/joystick", json={"y": 100}).status_code)
+
+        with gateway.motor_lock:
+            with patch.object(gateway, "joystick_to_command", side_effect=lambda x,y: (validated.set() or "F")):
+                worker = threading.Thread(target=request_in_thread, daemon=True)
+                worker.start()
+                self.assertTrue(validated.wait(2))
+                gateway.security["detection_reason"] = "CAN_ANOMALY"
+                gateway.last_motor_cmd = "F"
+                gateway.execute_block(None)
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [403])
+        self.assertEqual(bytes(self.rx.recv(0.2).data), b"S")
+        self.assertIsNone(self.rx.recv(0.01))
+
+    def test_blocked_client_cannot_cancel_containment_via_ml_toggle(self):
+        self.client.environ_base["REMOTE_ADDR"] = gateway.ATTACKER_IP
+        gateway.security["detection_reason"] = "NETWORK_ATTACKER_PRESENT"
+        gateway.execute_block(gateway.ATTACKER_IP)
+        gateway.security["ml"]["enabled"] = True
+        self.assertEqual(self.client.post("/api/ml/toggle", json={"enabled": False}).status_code, 403)
+        self.assertEqual(gateway.security["phase"], "BLOCKED")
+
+    def test_mode_switch_during_scoring_discards_obsolete_result(self):
+        gateway.security["ml"]["enabled"] = True
+        inactive = dict(exists=False, up=False, has_ip=False, active=False)
+
+        def score_while_switching():
+            self.assertEqual(self.client.post("/api/ml/toggle", json={"enabled": False}).status_code, 200)
+            self.assertEqual(self.client.post("/api/ml/toggle", json={"enabled": True}).status_code, 200)
+            return -0.5, True
+
+        # Ending on the same enabled value must still invalidate the old sample.
+        with patch.object(gateway, "ml_bundle", object()), \
+             patch.object(gateway, "ml_score_now", side_effect=score_while_switching), \
+             patch.multiple(gateway, read_ap_interface=lambda: inactive,
+                            service_active=lambda name: False,
+                            read_usb_state=lambda now: dict(present=False, attack_triggered=False, status="IDLE", device=None)):
+            gateway.monitor_tick(100)
+        self.assertEqual(gateway.security["phase"], "NORMAL")
+        self.assertIsNone(gateway.security["ml"]["score"])
+
+    def test_can_shutdown_waits_for_send_and_closes_only_once(self):
+        from unittest.mock import Mock
+        started, release, closed = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def send(*args, **kwargs):
+            started.set()
+            if not release.wait(2):
+                errors.append("send was never released")
+            if closed.is_set():
+                errors.append("shutdown overlapped send")
+
+        fake = Mock()
+        fake.send.side_effect = send
+        fake.shutdown.side_effect = closed.set
+        gateway.bus = fake
+        sending = threading.Thread(target=gateway.can_send, args=(can.Message(),), daemon=True)
+        closing = threading.Thread(target=gateway.close_bus, daemon=True)
+        try:
+            sending.start()
+            self.assertTrue(started.wait(2))
+            closing.start()
+            self.assertFalse(closed.wait(0.05))
+        finally:
+            release.set()
+            sending.join(2)
+            closing.join(2)
+        self.assertFalse(sending.is_alive() or closing.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(closed.is_set())
+        self.assertIsNone(gateway.bus)
+        gateway.close_bus()
+        fake.shutdown.assert_called_once()
+        gateway.bus = self.tx
+        gateway.close_bus(expected=fake)
+        self.assertIs(gateway.bus, self.tx)
+
+    def test_shutdown_prevents_reopening_bus(self):
+        gateway.bus = None
+        try:
+            gateway.shutdown()
+            with patch.object(can.interface, "Bus") as constructor:
+                self.assertIsNone(gateway.get_bus())
+                constructor.assert_not_called()
+        finally:
+            gateway.stop_event.clear()
+
+    def test_synthetic_flood_scores_as_anomaly_through_live_path(self):
+        from train_can_ids_model import simulate_normal, fit_model
+        from can_features import WINDOW_SECONDS
+        bundle = fit_model(simulate_normal(600, rng=random.Random(7)), 600)
+        flood = [(100 + t * .002, 0x100, b"F") for t in range(1000)]
+        with patch.object(gateway, "ml_bundle", bundle), patch.object(gateway.time, "time", return_value=102):
+            gateway.can_window.extend(flood)
+            score, anomaly = gateway.ml_score_now()
+            self.assertLess(score, 0)
+            self.assertTrue(anomaly)
+            self.assertEqual(len(extract_features(flood)), len(FEATURE_NAMES))
+            # Silent buses must not keep replaying stale attack windows forever.
+            with patch.object(gateway.time, "time", return_value=102 + WINDOW_SECONDS + 1):
+                gateway.ml_score_now()
+            self.assertEqual(len(gateway.can_window), 0)
 
     def test_sensor_telemetry_updates_dashboard(self):
         gateway.handle_can_message(can.Message(arbitration_id=0x120, data=[0xE8, 3], is_extended_id=False))
@@ -222,11 +365,60 @@ class GatewayTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_model_save_creates_directory_and_preserves_previous_on_failure(self):
+        from train_can_ids_model import save_model
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "new" / "model.joblib"
+            save_model({"version": 1}, destination)
+            self.assertEqual(joblib.load(destination), {"version": 1})
+            before = destination.read_bytes()
+
+            def interrupted_dump(bundle, temporary):
+                Path(temporary).write_bytes(b"partial model")
+                raise OSError("interrupted")
+
+            with patch("train_can_ids_model.joblib.dump", side_effect=interrupted_dump):
+                with self.assertRaises(OSError):
+                    save_model({"version": 2}, destination)
+            self.assertEqual(destination.read_bytes(), before)
+            self.assertEqual(list(destination.parent.iterdir()), [destination])
+            save_model({"version": 2}, destination)
+            self.assertEqual(joblib.load(destination), {"version": 2})
+
+    def test_controller_and_trainer_share_expanded_model_paths(self):
+        import train_can_ids_model as trainer
+        self.assertIs(trainer.project_path, gateway.project_path)
+        for value, expected in (
+            ("models/test.joblib", gateway.PROJECT_ROOT / "models/test.joblib"),
+            (str(Path.home() / "absolute.joblib"), Path.home() / "absolute.joblib"),
+            ("~/test.joblib", Path.home() / "test.joblib"),
+        ):
+            with self.subTest(value=value), patch.dict(os.environ, ML_MODEL_PATH=value):
+                self.assertEqual(Path(trainer.project_path("ML_MODEL_PATH", "default.joblib")), expected)
+
+    def test_offline_features_share_algorithm_but_keep_rate_overrides_separate(self):
+        from ids import feature_extraction as offline
+        from can_features import EXPECTED_RATE_HZ
+        frames = [(0.5, 0x100, b"F"), (0.1, 0x120, b"\x12\x34"), (1.5, 0x999, b"X")]
+        for window in ([], frames, [(0, 0x011, b"\x01")]):
+            self.assertEqual(offline.extract_features(window), extract_features(window))
+        original_rates = offline.EXPECTED_RATE_HZ.copy()
+        try:
+            offline.update_expected_rates({0x999: 1.0})
+            self.assertEqual(offline.extract_features(frames)[2], 0)
+            self.assertGreater(extract_features(frames)[2], 0)
+            self.assertNotIn(0x999, EXPECTED_RATE_HZ)
+        finally:
+            offline.EXPECTED_RATE_HZ.clear()
+            offline.EXPECTED_RATE_HZ.update(original_rates)
+            offline.KNOWN_IDS.clear()
+            offline.KNOWN_IDS.update(original_rates)
+
     def test_env_load_from_other_working_directory_and_environment_wins(self):
         # A private temporary project avoids touching the user's per-device .env.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("app.py", "can_features.py"):
+            for name in ("app.py", "can_features.py", "project_config.py"):
                 (root / name).write_bytes((Path(gateway.__file__).parent / name).read_bytes())
             (root / ".env").write_text('APP_PORT=5088\nCAN_CHANNEL=virtual-test\nHOME_PASSWORD="space # secret"\nUSB_STATE_FILE=run/test.json\n')
             env = dict(os.environ, APP_PORT="5099")

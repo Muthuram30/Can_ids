@@ -44,12 +44,18 @@ FEATURE_NAMES = [
 ]
 
 
-def extract_features(frames, window_seconds=WINDOW_SECONDS):
+def extract_features(frames, window_seconds=WINDOW_SECONDS, *, expected_rates=None):
     """frames: list of (timestamp, arbitration_id, data_bytes) tuples, data_bytes a
     bytes-like of 0-8 bytes, covering one window. Returns a list[float] in FEATURE_NAMES
     order. Always returns a full vector, even for an empty/sparse window, so live
     inference never has to special-case "not enough data" -- an empty window just reads
-    as zero load, which the model has also seen in training."""
+    as zero load. The synthetic trainer does not currently train on empty windows.
+    Offline experiments may supply their own expected_rates without mutating the
+    live baseline. Population variance is intentional for the complete window."""
+    if not math.isfinite(window_seconds) or window_seconds <= 0:
+        raise ValueError("window_seconds must be finite and positive")
+    expected_rates = EXPECTED_RATE_HZ if expected_rates is None else expected_rates
+    known_ids = set(expected_rates)
     n = len(frames)
     if n == 0:
         return [0.0] * len(FEATURE_NAMES)
@@ -62,11 +68,13 @@ def extract_features(frames, window_seconds=WINDOW_SECONDS):
         ids_seen.setdefault(aid, []).append((ts, data))
     unique_id_count = len(ids_seen)
 
-    unknown_frames = sum(len(v) for k, v in ids_seen.items() if k not in KNOWN_IDS)
+    unknown_frames = sum(len(v) for k, v in ids_seen.items() if k not in known_ids)
     unknown_id_ratio = unknown_frames / n
 
     max_rate_deviation = 0.0
-    for aid, expected in EXPECTED_RATE_HZ.items():
+    for aid, expected in expected_rates.items():
+        if expected <= 0:  # preserve the offline API's disabled-rate behavior
+            continue
         observed = len(ids_seen.get(aid, [])) / window_seconds
         dev = abs(observed - expected) / expected
         max_rate_deviation = max(max_rate_deviation, dev)

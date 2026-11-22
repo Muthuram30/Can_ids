@@ -1,5 +1,13 @@
 # Verification and remaining device checks — 22 November 2026
 
+## Current review fixes
+
+After the follow-up changes, **54 Python tests and four executable dashboard JavaScript tests passed**. Python compilation and Git whitespace checks passed. The default synthetic trainer completed again (3,600 windows; 0/60 generated normal validation windows flagged, all three illustrative generated attack cases flagged). These do not establish physical detection accuracy or latency.
+
+See [the full review follow-up](code-review-followup.md) for corrected claims, regression coverage and execution limits. Fresh dependency installation failed on package-host DNS; local tests used a project virtual environment with existing compatible packages and official python-can source, without modifying global/other-project packages. Ruff and the optional Waitress server were not runnable locally; Bash returned access denied and no firmware toolchain/testbed was available. Earlier results below remain historical evidence, not a fresh hardware/deployment run.
+
+The final pass additionally verified detection-mode changes during scoring and interrupted model saves. Git Bash was also attempted, but its process initialization was denied by the sandbox. Firmware now guards ToF reads after failed initialization; compilation and flashing still require the Arduino toolchain.
+
 ## Source preservation
 
 The original public head was `711fa37a542bc292c766dbe3a42093cf5a9e6557`, with tree `ac5edf0d9df2efc2274a1aeed13a5ded2daba066`. The retrieved source files and five existing local photos reproduce that tree exactly. The GitHub-signed commit and its original parent history were preserved locally, with branch `backup/before-pi-integration-20261122` and an original-history Git bundle. No existing local CAN project folder was modified.

@@ -147,9 +147,15 @@ const cmdLabel = document.getElementById('cmdLabel');
 let dragging = false;
 let joyX = 0, joyY = 0;
 let locked = false, wasBlocked = false, failCount = 0;
+const JOYSTICK_SEND_MS = 50;
+let lastJoySend = -Infinity, joyPending = null, joyInFlight = false, joyTimer = null;
 
 function applyBlocked(){
   locked = true; wasBlocked = true; dragging = false;
+  joyPending = null; joyX = 0; joyY = 0;
+  clearTimeout(joyTimer); joyTimer = null;
+  setStickPos(0, 0);
+  cmdLabel.textContent = 'S';
   document.body.classList.add('locked');
   document.getElementById('blockedOverlay').style.display = 'flex';
   document.getElementById('offlineBar').style.display = 'none';
@@ -184,11 +190,31 @@ function sendJoystick(x, y){
   if (locked) return;
   joyX = x; joyY = y;
   cmdLabel.textContent = labelFor(x, -y);
+  joyPending = {x: x, y: -y};
+  pumpJoystick();
+}
+
+function pumpJoystick(){
+  if (locked || joyInFlight || !joyPending) return;
+  clearTimeout(joyTimer); joyTimer = null;
+  // STOP bypasses the movement throttle. One request at a time preserves
+  // ordering, so an older movement cannot finish after the release STOP.
+  const stop = labelFor(joyPending.x, joyPending.y) === 'S';
+  const wait = JOYSTICK_SEND_MS - (performance.now() - lastJoySend);
+  if (!stop && wait > 0){
+    joyTimer = setTimeout(pumpJoystick, wait);
+    return;
+  }
+  const command = joyPending;
+  joyPending = null; joyInFlight = true; lastJoySend = performance.now();
   fetch('/api/joystick', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({x: x, y: -y})   // invert: screen-up (negative dy) = forward
-  }).then(handleControlResponse).catch(() => {});
+    body: JSON.stringify(command)
+  }).then(handleControlResponse).catch(() => {}).finally(() => {
+    joyInFlight = false;
+    pumpJoystick();
+  });
 }
 
 function handleMove(clientX, clientY){
@@ -207,11 +233,12 @@ base.addEventListener('pointerup',     () => { dragging = false; resetStick(); }
 base.addEventListener('pointercancel', () => { dragging = false; resetStick(); });
 
 function setMl(enabled){
+  if (locked) return;
   fetch('/api/ml/toggle', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({enabled: enabled})
-  }).catch(() => {});
+  }).then(handleControlResponse).catch(() => {});
 }
 
 function setLock(on){

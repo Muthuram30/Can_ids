@@ -1,6 +1,4 @@
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <Adafruit_VL53L0X.h>
 #include <SPI.h>
 #include <mcp_can.h>
@@ -18,8 +16,8 @@
 // ============================================================
 #define I2C_SDA 21
 #define I2C_SCL 22
-Adafruit_MPU6050 mpu;
 Adafruit_VL53L0X tof = Adafruit_VL53L0X();
+bool tofReady = false;
 
 // ============================================================
 // Ultrasonic
@@ -75,16 +73,8 @@ void setup() {
 
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  if (!mpu.begin()) {
-    Serial.println("MPU6050 NOT FOUND");
-  } else {
-    Serial.println("MPU6050 OK");
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  }
-
-  if (!tof.begin()) {
+  tofReady = tof.begin();
+  if (!tofReady) {
     Serial.println("ToF NOT FOUND");
   } else {
     Serial.println("ToF OK");
@@ -118,9 +108,12 @@ void loop() {
     float leftCM  = readUltrasonicCM(LEFT_TRIG, LEFT_ECHO);
     float rightCM = readUltrasonicCM(RIGHT_TRIG, RIGHT_ECHO);
 
-    VL53L0X_RangingMeasurementData_t measure;
-    tof.rangingTest(&measure, false);
-    uint16_t tofMM = (measure.RangeStatus != 4) ? measure.RangeMilliMeter : 0xFFFF;
+    uint16_t tofMM = 0xFFFF;
+    if (tofReady) {
+      VL53L0X_RangingMeasurementData_t measure = {};
+      tof.rangingTest(&measure, false);
+      if (measure.RangeStatus == 0) tofMM = measure.RangeMilliMeter;
+    }
 
     // ToF distance -> 0x120 (2 bytes, little-endian mm; 0xFFFF = out of range)
     byte tofBuf[2] = { (byte)(tofMM & 0xFF), (byte)(tofMM >> 8) };

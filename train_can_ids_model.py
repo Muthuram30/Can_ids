@@ -3,7 +3,7 @@
 train_can_ids_model.py -- trains the Isolation Forest used by app.py's ML toggle.
 
 Run this once (and again any time you change can_features.py or the CAN ID map):
-    pip install scikit-learn numpy joblib --break-system-packages
+    .venv/bin/python -m pip install -r requirements.txt
     python3 train_can_ids_model.py
 
 It simulates normal bus traffic matching EXPECTED_RATE_HZ in can_features.py (each
@@ -18,11 +18,12 @@ Writes can_ids_model.joblib (StandardScaler + IsolationForest + feature order) n
 to this script. app.py loads that file; if it's missing, the ML toggle reports
 "model not available" rather than crashing.
 """
-import json
 import os
 import random
+import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
+from project_config import PROJECT_ROOT, project_path
 
 import joblib
 import numpy as np
@@ -31,28 +32,26 @@ from sklearn.preprocessing import StandardScaler
 
 from can_features import EXPECTED_RATE_HZ, FEATURE_NAMES, WINDOW_SECONDS, extract_features
 
-random.seed(7)
-HERE = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(Path(HERE) / ".env", override=False)
-MODEL_PATH = str(Path(HERE) / os.getenv("ML_MODEL_PATH", "can_ids_model.joblib"))
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+MODEL_PATH = project_path("ML_MODEL_PATH", "can_ids_model.joblib")
 
 SIM_HOURS = 2.0          # simulated normal traffic to train on
-N_ANOMALY_CHECKS = 6      # just for the printed sanity check at the end
 
 
-def simulate_normal(duration_s):
+def simulate_normal(duration_s, rng=None):
     """One synthetic frame stream: each known ID fires at its expected rate with
     +/-15% timing jitter and a small amount of payload noise around a per-ID baseline."""
+    rng = random if rng is None else rng
     frames = []
-    baseline_payload = {aid: bytes(random.randint(0, 255) for _ in range(8)) for aid in EXPECTED_RATE_HZ}
+    baseline_payload = {aid: bytes(rng.randint(0, 255) for _ in range(8)) for aid in EXPECTED_RATE_HZ}
     for aid, rate in EXPECTED_RATE_HZ.items():
         period = 1.0 / rate
-        t = random.uniform(0, period)
+        t = rng.uniform(0, period)
         base = baseline_payload[aid]
         while t < duration_s:
-            jitter = period * random.uniform(-0.15, 0.15)
+            jitter = period * rng.uniform(-0.15, 0.15)
             ts = max(0.0, t + jitter)
-            data = bytes(min(255, max(0, b + random.randint(-2, 2))) for b in base)
+            data = bytes(min(255, max(0, b + rng.randint(-2, 2))) for b in base)
             frames.append((ts, aid, data))
             t += period
     frames.sort(key=lambda f: f[0])
@@ -97,21 +96,41 @@ def simulate_attack_windows():
     return cases
 
 
-def main():
-    print(f"Simulating {SIM_HOURS}h of normal traffic...")
-    frames = simulate_normal(SIM_HOURS * 3600)
-    windows = windows_from_frames(frames, SIM_HOURS * 3600)
+def fit_model(frames, duration_s):
+    """Fit the compatible live bundle; attack data is never used here."""
+    windows = windows_from_frames(frames, duration_s)
     X = np.array([extract_features(w) for w in windows])
-    print(f"{len(windows)} training windows, feature shape {X.shape}")
-
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
 
     model = IsolationForest(n_estimators=200, contamination=0.02, random_state=7)
     model.fit(Xs)
+    return {"scaler": scaler, "model": model, "feature_names": FEATURE_NAMES,
+            "window_seconds": WINDOW_SECONDS}
 
-    joblib.dump({"scaler": scaler, "model": model, "feature_names": FEATURE_NAMES,
-                 "window_seconds": WINDOW_SECONDS}, MODEL_PATH)
+
+def save_model(bundle, destination):
+    """Replace a complete model atomically, preserving the old file on failure."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".can-model-", suffix=".tmp", dir=destination.parent)
+    os.close(descriptor)
+    try:
+        joblib.dump(bundle, temporary)
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def main():
+    random.seed(7)
+    print(f"Simulating {SIM_HOURS}h of normal traffic...")
+    frames = simulate_normal(SIM_HOURS * 3600)
+    bundle = fit_model(frames, SIM_HOURS * 3600)
+    scaler, model = bundle["scaler"], bundle["model"]
+    print(f"{int(SIM_HOURS * 3600 / WINDOW_SECONDS)} training windows, {len(FEATURE_NAMES)} features")
+
+    save_model(bundle, MODEL_PATH)
     print(f"Saved model to {MODEL_PATH}")
 
     print("\nSanity check (scores on NORMAL validation windows, should be mostly > 0):")

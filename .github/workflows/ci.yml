@@ -13,7 +13,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: python -m pip install -r requirements.txt
+      - run: python -m pip install -r requirements-dev.txt -r requirements-server.txt
+      - run: python -m ruff check .
       - run: python -m unittest discover -s tests -v
-      - run: python -m compileall -q app.py can_features.py scripts usb ids
+      - run: python -m compileall -q app.py can_features.py project_config.py train_can_ids_model.py scripts usb ids
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/dashboard.test.cjs
       - run: for script in scripts/*.sh can/can0_setup.sh; do bash -n "$script"; done

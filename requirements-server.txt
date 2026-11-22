@@ -1,0 +1,2 @@
+# Optional threaded server; launch through app.py so monitoring threads start.
+waitress>=3.0.2,<4
