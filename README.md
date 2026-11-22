@@ -1,5 +1,7 @@
 # CAN IDS — Raspberry Pi + ESP32 laboratory testbed
 
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![ESP32](https://img.shields.io/badge/ESP32-B72527?logo=espressif&logoColor=white) ![SocketCAN](https://img.shields.io/badge/SocketCAN-59488F) ![Linux](https://img.shields.io/badge/Linux-795900?logo=linux&logoColor=white) ![Flask](https://img.shields.io/badge/Flask-325B6B?logo=flask&logoColor=white)
+
 A Raspberry Pi gateway controls three ESP32 ECUs over CAN at 500 kbit/s. Its Flask dashboard shows heartbeats, distance sensors, motor/lock state and the IDS countdown. Use Windows Terminal, PuTTY, Raspberry Pi Connect or VS Code to work on the same Pi checkout.
 
 ![Vehicle prototype with Raspberry Pi, CAN modules and sensors](docs/images/hardware-setup-1.jpeg)
